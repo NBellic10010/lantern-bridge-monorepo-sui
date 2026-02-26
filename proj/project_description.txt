@@ -1,0 +1,145 @@
+這是一份為你的 **Lantern V1.0 (跨鏈生息金庫)** 量身定制的**生產級技術架構設計文檔**。
+
+這份設計拋棄了黑客松的「玩具思維」，以**高可用性、資金安全、極致用戶體驗**為核心，將系統劃分為四個邏輯層級。你可以直接將此作為項目的 README 或架構白皮書。
+
+---
+
+# 🏮 Lantern V1.0 技術架構設計 (Production-Ready)
+
+## 1. 系統架構總覽 (System Architecture Diagram)
+
+```text
+[ 用戶端 (Web/Mobile) ]
+       │
+       ├─► [ Wormhole Widget ] ──(跨鏈橋接)──► Ethereum / Solana
+       │
+       └─► [ Lantern dApp ] ──(構建 PTB)──┐
+                                          │
+                                    (請求 Gas 代付與審核)
+                                          │
+[ 後端服務層 (Backend & Relayer) ] ◄──────┘
+       │
+       ├─► [ 風控引擎 (Anti-Sybil DB) ] ──校驗地址/次數/金額
+       ├─► [ Gas Station API ] ──────────調用 Shinami/Enoki 提供 SUI 簽名
+       │
+       └──(雙簽名 PTB 上鏈)──┐
+                             │
+[ Sui 區塊鏈層 (On-Chain) ] ◄─┘
+       │
+       ├─► [ Lantern Vault 合約 ] ──(份額記帳、手續費扣除、熔斷控制)
+       │          │
+       │          └──(資產路由)──┐
+       │                         │
+[ 底層 DeFi 樂高 (DeFi Legos) ] ◄─┘
+       │
+       ├─► [ Wormhole 合約 ] ── 校驗 Canonical wUSDC
+       └─► [ Navi Protocol ] ── 存入 wUSDC，獲取生息憑證 (nUSDC)
+
+```
+
+---
+
+## 2. 核心模塊詳細設計 (Module Specifications)
+
+### 2.1 智能合約層 (Smart Contract Layer - Sui Move)
+
+合約是資金的保險箱。V1.0 只需要一個核心 Package：`lantern_vault`。
+
+* **`vault::core` (核心金庫邏輯)**
+* **記帳模型 (Accounting)：** 採用類似 ERC-4626 的標準。用戶存入 `wUSDC`，合約內部記錄用戶的 `LanternShare` (份額)。提款時，根據 `Share` 計算本金+利息。
+* `deposit<T>(coin: Coin<T>)`: 接收存款，並在同一個函數內調用 Navi 接口存入資金，更新用戶 Share。
+* `withdraw<T>(shares: u64)`: 燃燒 Share，從 Navi 贖回 `wUSDC` 並轉給用戶。
+
+
+* **`vault::admin` (權限與治理)**
+* **`AdminCap` 控制：** 只有持有管理員憑證的地址可以修改全局參數。
+* **動態費率：** 設置 `fee_rate` (如 10% 的利潤抽成)，合約在用戶提款時自動扣除利潤部分並轉入協議金庫。
+
+
+* **`vault::safety` (安全與風控)**
+* **緊急熔斷 (Circuit Breaker)：** 提供 `pause` 和 `unpause` 接口。一旦觸發，禁止所有 `deposit` 操作（但為了合規與信任，通常允許 `withdraw`）。
+* **白名單校驗：** 嚴格斷言 `<T>` 必須是官方的 Wormhole USDC 地址，防止假幣攻擊。
+
+
+
+### 2.2 後端中繼層 (Backend & Relayer Layer)
+
+負責消除用戶 Gas 摩擦，並保護協議免受惡意攻擊。
+
+* **Gas Sponsor Service (代付服務器)：**
+* 接收前端傳來的未簽名 PTB (Programmable Transaction Block)。
+* 調用企業級 Gas Station (如 **Shinami Sponsored API**) 獲取 SUI 支付對象並進行後端簽名。
+
+
+* **Anti-Sybil Engine (防女巫風控引擎)：**
+* **資料庫 (PostgreSQL + Redis)：** 記錄 `wallet_address`, `ip_address`, `timestamp`。
+* **攔截規則：** 存款金額 < 50 USDC 拒絕代付；同一地址 24 小時內 > 1 次拒絕代付。
+
+
+* **RPC 負載均衡 (RPC Manager)：**
+* 配置 2-3 個私有 RPC (QuickNode, Alchemy)。如果首選 RPC 節點超時或報錯，自動 Fallback 到備用節點，確保生產環境可用性。
+
+
+
+### 2.3 前端與客戶端層 (Frontend Layer)
+
+極致的 Web3 用戶體驗，隱藏跨鏈與區塊鏈底層的複雜性。
+
+* **狀態聚合器 (State Aggregator)：**
+* 集成 `Wormholescan API`，實時以進度條展示跨鏈狀態（解決用戶跨鏈等待焦慮）。
+* 讀取 Navi API，動態展示當前真實 APY。
+
+
+* **PTB 構建器 (Transaction Builder)：**
+* 使用 `@mysten/sui/transactions`。前端負責構建包含 `deposit` 的 PTB，但**不直接發送**，而是將其序列化後發給你的後端審核。
+
+
+* **雙簽機制處理器 (Dual-Signature Handler)：**
+* 接收後端返回的「已包含代付 Gas 的 PTB」，喚起用戶錢包。用戶點擊確認後，前端將雙簽名 payload 提交上鏈。
+
+
+
+---
+
+## 3. 核心業務流：一鍵零 Gas 跨鏈生息 (Sequence Diagram)
+
+這將是你產品最核心的「Aha Moment (驚嘆時刻)」：
+
+1. **跨鏈到達：** 用戶在前端通過 Wormhole 將 Ethereum USDC 跨到 Sui，獲得 1000 `wUSDC`。此時用戶 Sui 錢包餘額為 `0 SUI`。
+2. **發起存入：** 用戶在 Lantern 點擊「一鍵存入」。
+3. **構建意圖：** 前端構建一個 PTB，調用 `lantern_vault::deposit`。
+4. **風控審核：** 前端將 PTB 發送給 Lantern 後端。後端校驗發現：這是一個新用戶，且存入金額 1000 USDC，符合代付條件。
+5. **附加 Gas：** 後端調用 Shinami API，為該 PTB 注入 Gas 支付對象，並簽名，返回給前端。
+6. **用戶簽名：** 前端喚起錢包，錢包提示「手續費由贊助商支付」。用戶點擊確認。
+7. **原子執行 (Atomic Execution)：**
+* 區塊鏈扣除代付站的 SUI 作為 Gas。
+* Lantern Vault 接收 1000 `wUSDC`。
+* Lantern Vault 將 1000 `wUSDC` 存入 Navi Protocol。
+* Lantern Vault 記錄用戶獲得 1000 Shares。
+*(以上所有動作在同一個 Sui 區塊內、同一個 PTB 中瞬間完成)*
+
+
+
+---
+
+## 4. 技術棧推薦 (Tech Stack)
+
+* **智能合約：** Sui Move + Sui Framework + Sui Move Test CLI (強烈建議寫高覆蓋率的單元測試)。
+* **前端：** Next.js 14 (App Router) + Tailwind CSS + Radix UI (借鑒你競品的組件庫) + `@mysten/dapp-kit` + `Wormhole Connect SDK`。
+* **後端：** Node.js (Express / NestJS) 或 Go + PostgreSQL (存儲風控數據) + Redis (防刷接口限流)。
+* **基礎設施：** * **Gas Station:** Shinami (首選) 或 Mysten Enoki。
+* **RPC Node:** QuickNode 或 Triton One。
+
+
+
+---
+
+### 💡 實施建議 (Next Steps for Developer)
+
+對於開發順序，建議採用**自下而上**的策略：
+
+1. **Week 1 (合約)：** 寫死 Navi 的地址，跑通 Move 合約中的 `deposit` 和 `withdraw`，確保能成功調用 Navi 接口。完成合約部署。
+2. **Week 2 (後端代付)：** 註冊 Shinami 測試網 API，寫一個簡單的 Node.js 腳本，跑通「後端代付 Gas」的雙簽名流程。
+3. **Week 3 (前端與聯調)：** 搭建 Web 界面，接入 Wormhole SDK，並將前面的合約與後端串聯起來。
+
+這個架構砍掉了 V2.0 複雜的 Keeper 輪詢和價格預言機，將火力全部集中在**「PTB 原子操作」**和**「Gas 代付風控」**上。只要這個 V1.0 穩定上線，在 Sui 生態裡就是一個非常有商業價值的基礎設施。

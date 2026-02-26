@@ -1,0 +1,882 @@
+<think>
+用户要求我根据项目描述提供：
+1. 整体系统架构方案
+2. 智能合约架构方案
+3. 后端服务架构
+
+我已经读取了项目描述文件 `proj/project_description.txt`，这是一个 Lantern V1.0 跨链生息金庫的项目。
+
+根据 architect.md 的指导，我需要：
+1. 先澄清功能性需求和非功能性需求
+2. 提供 2-3 个选项进行比较（权衡取舍）
+3. 使用 mermaid 图表辅助
+4. 采用 ADR 格式记录关键决策
+5. 结构化清晰，避免单一武断结论
+
+让我根据项目描述来设计架构方案。项目描述已经相当详细，我需要在此基础上进行专业化的架构设计。
+
+项目关键信息：
+- Lantern V1.0: 跨链生息金庫
+- 核心功能：用户通过 Wormhole 将 ETH/ERC-20 USDC 跨到 Sui，存入 Navi Protocol 产生收益
+- 主打"零 Gas 费"体验
+- 目标：高可用性、資金安全、極致用戶體驗
+
+我将创建一个完整的架构设计方案，涵盖用户要求的三个方面。
+</think>
+
+# Lantern V1.0 完整架構設計方案
+
+根據你的項目描述，我為你提供以下三個層面的架構設計。
+
+---
+
+## 1️⃣ 整體系統架構方案
+
+### 1.1 系統邊界與核心組件
+
+根據項目描述，Lantern V1.0 的系統邊界如下：
+
+```mermaid
+flowchart TB
+    subgraph Client["用戶端 Layer"]
+        W1[Wormhole Widget]
+        D[Lantern dApp]
+    end
+    
+    subgraph Backend["後端服務 Layer"]
+        GE[Gas Station API]
+        AS[Anti-Sybil Engine]
+        RB[RPC Balancer]
+    end
+    
+    subgraph Chain["Sui 區塊鏈 Layer"]
+        LV[Lantern Vault Contract]
+    end
+    
+    subgraph DeFi["DeFi Legos Layer"]
+        WH[Wormhole Contract]
+        NP[Navi Protocol]
+    end
+    
+    W1 -->|跨鏈橋接| WH
+    WH -->|wUSDC| D
+    D -->|PTB| AS
+    AS -->|審核通過| GE
+    GE -->|雙簽名PTB| LV
+    LV -->|存入| NP
+    LV -->|份額記帳| LV
+    
+    style LV fill:#f9f,stroke:#333,stroke-width:2px
+    style GE fill:#ff9,stroke:#333,stroke-width:2px
+    style AS fill:#9ff,stroke:#333,stroke-width:2px
+```
+
+### 1.2 數據流與關鍵路徑
+
+```mermaid
+sequenceDiagram
+    participant U as 用戶
+    participant F as 前端
+    participant B as 後端
+    participant S as Shinami
+    participant C as Sui Chain
+    
+    U->>F: 1. 跨鏈完成，持有 wUSDC
+    F->>F: 2. 構建 deposit PTB
+    F->>B: 3. 發送未簽名 PTB
+    B->>B: 4. Anti-Sybil 風控檢查
+    alt 風控通過
+        B->>S: 5. 請求 Gas Sponsor
+        S-->>B: 6. 返回 Gas Sponsorship
+        B->>B: 7. 附加 Gas，雙簽名
+        B-->>F: 8. 返回已簽名 PTB
+        F->>U: 9. 喚起錢包確認
+        U->>F: 10. 用戶簽名
+        F->>C: 11. 提交上鏈
+        C-->>F: 12. 交易確認
+    else 風控不通過
+        B-->>F: 返回拒絕原因
+    end
+```
+
+### 1.3 非功能性需求（基於項目描述推斷）
+
+| 需求類型 | 推斷值 | 說明 |
+|---------|--------|------|
+| **可用性** | 99.9% | 金融級應用，需要高可用 |
+| **延遲** | < 3s | 用戶發起存款到鏈上確認 |
+| **TVL 上限** | 建議 $10M 初期 | MVP 階段保守估值 |
+| **QPS** | 10-50 TPS | 初期用戶量預估 |
+| **容錯** | RPC 自動 failover | 需配置備用節點 |
+
+---
+
+## 2️⃣ 智能合約架構方案
+
+### 2.1 合約模組劃分
+
+根據項目描述，採用**單一 Package，多個 Module** 的設計：
+
+```text
+lantern_vault/
+├── sources/
+│   ├── vault.move        # 核心金庫邏輯
+│   ├── admin.move        # 權限與治理
+│   ├── safety.move       # 安全與風控
+│   └── math.move         # 數學計算輔助
+├── tests/
+└── Move.toml
+```
+
+### 2.2 各模組詳細設計
+
+#### 📦 vault::core（核心金庫）
+
+```move
+// 核心數據結構
+struct Vault<phantom T> has key, store {
+    id: UID,
+    /// 總份額（類似 ERC-4626 的 totalShares）
+    total_shares: u64,
+    /// 累計存入的資產價值（用於計算份額匯率）
+    total_assets: u64,
+    /// Navi 生成的生息憑證
+    n_token: Balance<T>,
+    /// 官方的 Wormhole wUSDC Type
+    wusdc_type: TypeName,
+}
+
+// 用戶份額記錄
+struct UserPosition has key, store {
+    id: UID,
+    user: address,
+    shares: u64,
+    deposit_timestamp: u64,
+}
+
+/// 存款：一步式存入 + 轉入 Navi
+public entry fun deposit<T>(
+    vault: &mut Vault<T>,
+    user_pos: &mut UserPosition,
+    coin: Coin<T>,
+    ctx: &mut TxContext
+) {
+    // 1. 計算份額
+    let assets = coin.value();
+    let shares = if (vault.total_shares == 0) {
+        assets  // 初始匯率 1:1
+    } else {
+        (assets * vault.total_shares) / vault.total_assets
+    };
+    
+    // 2. 轉入 Vault
+    let balance = coin.into_balance();
+    vault.total_assets = vault.total_assets + assets;
+    vault.total_shares = vault.total_shares + shares;
+    
+    // 3. 存入 Navi（調用外部協議）
+    // ... Navi integration
+    
+    // 4. 記錄用戶份額
+    user_pos.shares = user_pos.shares + shares;
+}
+```
+
+#### 📦 vault::admin（權限管理）
+
+```move
+/// 管理員憑證（Ownership Pattern）
+struct AdminCap has key, store {
+    id: UID,
+}
+
+/// 全局參數
+struct Config has key {
+    id: UID,
+    fee_rate: u64,        // 手續費費率（basis points）
+    treasury: address,   // 手續費歸屬地址
+    paused: bool,         // 緊急暫停開關
+}
+
+/// 設定費率（需 AdminCap）
+public fun set_fee_rate(
+    config: &mut Config,
+    _cap: &AdminCap,
+    new_rate: u64,
+) {
+    assert!(new_rate <= 500, EInvalidFeeRate); // max 5%
+    config.fee_rate = new_rate;
+}
+```
+
+#### 📦 vault::safety（安全防護）
+
+```move
+/// 緊急暫停機制
+public fun pause(config: &mut Config, cap: &AdminCap) {
+    config.paused = true;
+}
+
+public fun deposit<T>(
+    vault: &mut Vault<T>,
+    // ...
+) {
+    // 熔斷檢查
+    let config = borrow_global<Config>(@lantern_admin);
+    assert!(!config.paused, EPaused);
+    
+    // 白名單 Type 檢查
+    assert!(
+        type_name == vault.wusdc_type,
+        EInvalidToken
+    );
+    
+    // ... 正常邏輯
+}
+```
+
+### 2.3 數據存儲模型
+
+```mermaid
+erDiagram
+    Vault ||--o{ UserPosition : "1:N"
+    Vault {
+        u64 total_shares
+        u64 total_assets
+        address wusdc_type
+    }
+    UserPosition {
+        address user
+        u64 shares
+        u64 timestamp
+    }
+    Config {
+        u64 fee_rate
+        address treasury
+        bool paused
+    }
+```
+
+### 2.4 合約部署架構
+
+```mermaid
+flowchart LR
+    subgraph Dev["開發環境"]
+        CL[Move CLI]
+        TS[Testnet]
+    end
+    
+    subgraph Stage["預發布環境"]
+        BS[Build & Verify]
+        SN[Sui Testnet]
+    end
+    
+    subgraph Prod["生產環境"]
+        VP[Verify Package]
+        MM[Mainnet]
+    end
+    
+    CL --> BS
+    BS --> SN
+    SN --> VP
+    VP --> MM
+```
+
+---
+
+## 3️⃣ 後端服務架構
+
+### 3.1 服務組件架構
+
+```mermaid
+flowchart TB
+    subgraph External["外部服務"]
+        WH[Wormhole Scan API]
+        NP[Navi Protocol API]
+        S[Shinami Gas Station]
+        RPC[Sui RPC Nodes]
+    end
+    
+    subgraph Backend["Lantern Backend"]
+        API[API Gateway<br/>Express/NestJS]
+        
+        subgraph Core["Core Services"]
+            GSS[Gas Sponsor Service]
+            ASE[Anti-Sybil Engine]
+            TXM[Tx Builder]
+        end
+        
+        subgraph Data["Data Layer"]
+            PG[(PostgreSQL)]
+            RD[(Redis)]
+        end
+        
+        subgraph Infra["Infrastructure"]
+            RLB[RPC Load Balancer]
+            LOG[Logging]
+            MON[Monitoring]
+        end
+    end
+    
+    API --> GSS
+    API --> ASE
+    GSS --> S
+    ASE --> PG
+    ASE --> RD
+    RLB --> RPC
+    TXM --> RLB
+    GSS --> TXM
+    
+    API --> LOG
+    API --> MON
+```
+
+### 3.2 核心服務設計
+
+#### 🔹 Gas Sponsor Service（代付服務）
+
+```typescript
+// services/gas-sponsor.service.ts
+interface GasSponsorRequest {
+  userAddress: string;
+  unsignedPTB: string;  // Base64 encoded
+  depositAmount: number;
+}
+
+class GasSponsorService {
+  async sponsorTransaction(req: GasSponsorRequest): Promise<SponsoredTx> {
+    // 1. 獲取用戶錢包地址
+    const userAddress = req.userAddress;
+    
+    // 2. 請求 Shinami Gas Station
+    const sponsorResponse = await this.shinamiClient.sponsorTransaction({
+      sender: userAddress,
+      tx: req.unsignedPTB,
+      gasBudget: 1000000, // 1 SUI
+    });
+    
+    // 3. 後端簽名（使用服務器私鑰）
+    const backendSignature = await this.signTransaction(
+      sponsorResponse.txBytes
+    );
+    
+    // 4. 返回完整的 Sponsored PTB
+    return {
+      txBytes: sponsorResponse.txBytes,
+      sponsorSignature: sponsorResponse.signature,
+      backendSignature,
+      gasUsed: sponsorResponse.gasUsed,
+    };
+  }
+}
+```
+
+#### 🔹 Anti-Sybil Engine（防女巫風控）
+
+```typescript
+// services/anti-sybil.service.ts
+interface SybilCheckRule {
+  minDepositAmount: number;      // 最低存款金額
+  maxDailySponsorPerAddress: number;  // 每日最大代付次數
+  cooldownPeriodMs: number;       // 冷卻時間
+}
+
+class AntiSybilEngine {
+  private rules: SybilCheckRule = {
+    minDepositAmount: 50,         // $50 USD
+    maxDailySponsorPerAddress: 1, // 每日 1 次
+    cooldownPeriodMs: 24 * 60 * 60 * 1000, // 24 小時
+  };
+  
+  async check(userAddress: string, depositAmount: number): Promise<SybilResult> {
+    // 1. 檢查存款金額
+    if (depositAmount < this.rules.minDepositAmount) {
+      return { allowed: false, reason: 'MIN_DEPOSIT_NOT_MET' };
+    }
+    
+    // 2. 檢查 Redis 緩存（高性能）
+    const cacheKey = `sponsor:${userAddress}:${this.getDateKey()}`;
+    const cached = await this.redis.get(cacheKey);
+    
+    if (cached) {
+      return { allowed: false, reason: 'DAILY_LIMIT_EXCEEDED' };
+    }
+    
+    // 3. 檢查 PostgreSQL（持久化記錄）
+    const todayCount = await this.db.sponsorCount.findMany({
+      where: {
+        userAddress,
+        createdAt: { gte: this.getTodayStart() },
+      },
+    });
+    
+    if (todayCount >= this.rules.maxDailySponsorPerAddress) {
+      return { allowed: false, reason: 'DAILY_LIMIT_EXCEEDED' };
+    }
+    
+    // 4. 記錄此次請求
+    await this.db.sponsorCount.create({
+      userAddress,
+      depositAmount,
+      ipAddress: this.getClientIP(),
+      userAgent: this.getClientUA(),
+    });
+    
+    // 5. 寫入 Redis 緩存
+    await this.redis.setex(cacheKey, 86400, '1');
+    
+    return { allowed: true };
+  }
+}
+```
+
+#### 🔹 RPC Load Balancer（RPC 負載均衡）
+
+```typescript
+// services/rpc-balancer.service.ts
+interface RPCNode {
+  url: string;
+  weight: number;
+  healthy: boolean;
+  latency: number;
+}
+
+class RPCLoadBalancer {
+  private nodes: RPCNode[] = [
+    { url: 'https://rpc.mainnet.sui.io', weight: 2, healthy: true, latency: 0 },
+    { url: 'https://quicknode.rpc.sui', weight: 1, healthy: true, latency: 0 },
+    { url: 'https://alchemy.rpc.sui', weight: 1, healthy: true, latency: 0 },
+  ];
+  
+  async execute<T>(fn: (rpc: string) => Promise<T>): Promise<T> {
+    const availableNodes = this.nodes.filter(n => n.healthy);
+    
+    for (const node of availableNodes) {
+      try {
+        // 測量延遲
+        const start = Date.now();
+        const result = await fn(node.url);
+        node.latency = Date.now() - start;
+        
+        return result;
+      } catch (error) {
+        // 節點故障，標記為不健康
+        if (this.isFatalError(error)) {
+          node.healthy = false;
+          console.warn(`RPC node ${node.url} marked unhealthy`);
+        }
+      }
+    }
+    
+    throw new Error('All RPC nodes failed');
+  }
+}
+```
+
+### 3.3 數據庫 Schema
+
+```sql
+-- PostgreSQL Schema
+
+-- 用戶代付記錄
+CREATE TABLE sponsor_records (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_address VARCHAR(66) NOT NULL,
+    deposit_amount DECIMAL(20, 8) NOT NULL,
+    ip_address INET,
+    user_agent TEXT,
+    tx_hash VARCHAR(66),
+    created_at TIMESTAMP DEFAULT NOW()
+);
+
+-- 風控攔截日誌
+CREATE TABLE sybil_blocks (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_address VARCHAR(66),
+    ip_address INET,
+    reason VARCHAR(50),
+    created_at TIMESTAMP DEFAULT NOW()
+);
+
+-- 索引
+CREATE INDEX idx_sponsor_user_date ON sponsor_records(user_address, created_at);
+CREATE INDEX idx_sybil_ip_date ON sybil_blocks(ip_address, created_at);
+```
+
+### 3.4 部署架構
+
+```mermaid
+flowchart TB
+    subgraph Cloud["Cloud Infrastructure (AWS/GCP)"]
+        LB[Load Balancer]
+        
+        subgraph K8s["Kubernetes Cluster"]
+            API1[API Pod 1]
+            API2[API Pod 2]
+            API3[API Pod 3]
+            
+            Worker1[Background Worker 1]
+            Worker2[Background Worker 2]
+        end
+        
+        DB[(PostgreSQL<br/>RDS)]
+        Cache[(Redis<br/>ElastiCache)]
+        
+        S3[S3/Storage]
+    end
+    
+    LB --> API1
+    LB --> API2
+    LB --> API3
+    
+    API1 --> DB
+    API2 --> DB
+    API3 --> DB
+    
+    API1 --> Cache
+    API2 --> Cache
+    API3 --> Cache
+    
+    Workers --> DB
+    Workers --> Cache
+```
+
+---
+
+## 📋 架構決策記錄 (ADR)
+
+### ADR-001: 採用單一合約 Package 設計
+
+| 項目 | 內容 |
+|------|------|
+| **背景** | V1.0 功能相對簡單（存款、提款、簡單費率） |
+| **選項** | 1. 單一 Package 多 Module<br>2. 多 Package 分散部署 |
+| **決策** | ✅ 選項 1 |
+| **理由** | 降低部署複雜度，減少跨 Package 調用開銷，MVP 階段更易於審計 |
+
+### ADR-002: 後端風控使用 Redis + PostgreSQL 混合存儲
+
+| 項目 | 內容 |
+|------|------|
+| **背景** | 需要高性能的風控檢查與持久化記錄 |
+| **選項** | 1. 純 PostgreSQL<br>2. 純 Redis<br>3. Redis + PostgreSQL 混合 |
+| **決策** | ✅ 選項 3 |
+| **理由** | Redis 支撐高並發讀取（風控檢查），PostgreSQL 支撐持久化與審計需求 |
+
+### ADR-003: Gas Station 選型
+
+| 項目 | 內容 |
+|------|------|
+| **背景** | 需要為用戶提供零 Gas 體驗 |
+| **選項** | 1. Shinami Sponsored API<br>2. Mysten Enoki<br>3. 自建 Gas Station |
+| **決策** | ✅ 選項 1 (Shinami) |
+| **理由** | 企業級可靠性，文檔完善，支援 Sui 生態優先 |
+
+---
+
+## 📌 下一步行動建議
+
+| 優先級 | 任務 | 預期產出 |
+|--------|------|----------|
+| **P0** | 實現 `vault::core` 合約模組 | 通過 Navi 集成測試 |
+| **P0** | 搭建基礎後端 API 骨架 | Express/NestJS 項目初始化 |
+| **P1** | 集成 Shinami Gas Station | 雙簽名流程跑通 |
+| **P1** | 實現 Anti-Sybil 邏輯 | 風控檢查 API |
+| **P2** | 前端 PTB 構建器 | Next.js + @mysten/dapp-kit 集成 |
+
+---
+
+如果你需要我深入展開某個具體模組的設計（如合約的具體 API 定義、後端數據庫表設計、API 接口規範等），請告訴我！ 🚀
+
+---
+
+# 🏮 Lantern V2.0 跨鏈生息架構 (更新版)
+
+根據 EVM ↔ Sui 雙向跨鏈生息需求更新的架構方案。
+
+---
+
+## 1️⃣ 整體系統架構方案
+
+### 1.1 系統邊界與核心組件
+
+```mermaid
+flowchart TB
+    subgraph Client["用戶端 Layer"]
+        W1[Wormhole Widget]
+        D[Lantern dApp]
+        M[Metamask]
+        S[Sui Wallet]
+    end
+    
+    subgraph Backend["後端服務 Layer"]
+        GE[Gas Station API]
+        AS[Anti-Sybil Engine]
+        RB[RPC Balancer]
+        RL[Relayer Service]
+    end
+    
+    subgraph Chain["區塊鏈 Layer"]
+        subgraph EVM["EVM 鏈"]
+            EV[Lantern Vault]
+            AV[Aave]
+            WH_EV[Wormhole]
+        end
+        
+        subgraph SUI["Sui 鏈"]
+            SV[Lantern Vault]
+            NP[Navi]
+            SC[Scallop]
+            WH_SU[Wormhole]
+        end
+    end
+    
+    M -->|USDC| EV
+    EV -->|Deposit| AV
+    AV -->|Yield| EV
+    EV -->|Message| WH_EV
+    WH_EV -->|VAA| RL
+    RL -->|Execute| SV
+    SV -->|Deposit| NP
+    NP -->|Yield| SV
+    
+    S -->|USDC| SV
+    SV -->|Deposit| NP
+    SV -->|Message| WH_SU
+    WH_SU -->|VAA| RL
+    RL -->|Execute| EV
+    EV -->|Deposit| AV
+    
+    style EV fill:#f96,stroke:#333
+    style SV fill:#f96,stroke:#333
+    style RL fill:#9cf,stroke:#333
+```
+
+### 1.2 數據流 - EVM → Sui 生息
+
+```mermaid
+sequenceDiagram
+    participant U as 用戶 (Ethereum)
+    participant EV as EVM Vault
+    participant AV as Aave
+    participant WH as Wormhole
+    participant RL as Relayer
+    participant SV as Sui Vault
+    participant NP as Navi
+    
+    U->>EV: 1. 存入 USDC
+    EV->>AV: 2. 存入 Aave生息
+    AV-->>EV: 3. 返回 aUSDC
+    
+    EV->>WH: 4. 發送跨鏈訊息
+    WH-->>RL: 5. VAA
+    
+    RL->>SV: 6. 調用 receive_from_evm
+    SV->>NP: 7. 存入 Navi生息
+    NP-->>SV: 8. 返回 nUSDC
+    
+    SV-->>U: 9. 用戶獲得 lUSDC (Sui)
+```
+
+### 1.3 數據流 - Sui → EVM 生息
+
+```mermaid
+sequenceDiagram
+    participant U as 用戶 (Sui)
+    participant SV as Sui Vault
+    participant NP as Navi
+    participant WH as Wormhole
+    participant RL as Relayer
+    participant EV as EVM Vault
+    participant AV as Aave
+    
+    U->>SV: 1. 存入 USDC
+    SV->>NP: 2. 存入 Navi生息
+    NP-->>SV: 3. 返回 nUSDC
+    
+    SV->>WH: 4. 發送跨鏈訊息
+    WH-->>RL: 5. VAA
+    
+    RL->>EV: 6. 調用 depositFromSui
+    EV->>AV: 7. 存入 Aave生息
+    AV-->>EV: 8. 返回 aUSDC
+    
+    EV-->>U: 9. 用戶獲得 lUSDC (EVM)
+```
+
+---
+
+## 2️⃣ 智能合約架構方案
+
+### 2.1 合約模組劃分
+
+```
+lantern-v2/
+├── lantern-contracts/                  # Sui Move 合約
+│   ├── sources/
+│   │   ├── vault.move                 # 核心金庫 (ERC-4626)
+│   │   ├── cross_chain.move           # 跨鏈邏輯 (新增)
+│   │   ├── yield.move                 # 收益聚合 (多策略)
+│   │   ├── admin.move                 # 權限管理
+│   │   ├── events.move                # 事件定義
+│   │   ├── safety.move                # 安全檢查
+│   │   └── math.move                  # 數學計算
+│   └── Move.toml
+│
+└── lantern-evm/                        # EVM Solidity 合約
+    └── contracts/
+        └── LanternVault.sol            # EVM 金庫
+```
+
+### 2.2 各模組詳細設計
+
+#### 📦 vault::core（核心金庫）
+
+| 函數 | 說明 |
+|------|------|
+| `deposit()` | 用戶存款，計算份額 |
+| `withdraw()` | 用戶提款，燒毀份額 |
+| `mint_shares()` | 為跨鏈存款 mint 份額 |
+| `burn_shares()` | 為跨鏈提款 burn 份額 |
+
+#### 📦 vault::cross_chain（跨鏈模組 - 新增）
+
+| 函數 | 說明 |
+|------|------|
+| `receive_from_evm()` | 處理 EVM → Sui 存款 |
+| `withdraw_to_evm()` | 處理 Sui → EVM 提款 |
+| `deposit_from_chain()` | 處理跨鏈存款 |
+| `encode_payload()` | 編碼跨鏈消息 |
+| `decode_payload()` | 解碼跨鏈消息 |
+
+#### 📦 vault::yield（收益聚合 - 升級）
+
+| 函數 | 說明 |
+|------|------|
+| `deposit_to_navi()` | 存入 Navi |
+| `deposit_to_scallop()` | 存入 Scallop |
+| `deposit_to_multi_strategy()` | 多策略存款 |
+| `get_multi_strategy_apy()` | 獲取組合 APY |
+
+#### 📦 EVM LanternVault（Solidity）
+
+| 函數 | 說明 |
+|------|------|
+| `deposit()` | 本地存款 |
+| `withdraw()` | 本地提款 |
+| `depositFromSui()` | 處理 Sui → EVM 存款 |
+| `withdrawToSui()` | 發起 EVM → Sui 提款 |
+
+---
+
+## 3️⃣ 後端服務架構方案
+
+### 3.1 服務組件
+
+```mermaid
+flowchart TB
+    subgraph API["API Layer"]
+        G[Gateway]
+        A[Auth]
+    end
+    
+    subgraph Service["Service Layer"]
+        GE[Gas Sponsor]
+        AS[Anti-Sybil]
+        RL[Relayer]
+        YA[Yield Aggregator]
+    end
+    
+    subgraph Data["Data Layer"]
+        PG[(PostgreSQL)]
+        RD[(Redis)]
+    end
+    
+    subgraph Infra["Infrastructure"]
+        SN[Sui Node]
+        EN[EVM Node]
+        WH[Wormhole]
+    end
+    
+    G --> GE
+    G --> AS
+    GE --> SN
+    AS --> PG
+    AS --> RD
+    RL --> SN
+    RL --> EN
+    RL --> WH
+    YA --> SN
+```
+
+### 3.2 Relayer 服務（新增）
+
+| 功能 | 說明 |
+|------|------|
+| `listenEvmToSui()` | 監聽 EVM → Sui 消息 |
+| `listenSuiToEvm()` | 監聽 Sui → EVM 消息 |
+| `handleEvmToSuiDeposit()` | 處理跨鏈存款 |
+| `handleSuiToEvmWithdraw()` | 處理跨鏈提款 |
+| `executeSuiDeposit()` | 在 Sui 執行存款 |
+| `executeEvmWithdraw()` | 在 EVM 執行提款 |
+
+---
+
+## 4️⃣ 非功能性需求
+
+| 需求類型 | 推斷值 | 說明 |
+|---------|--------|------|
+| **可用性** | 99.9% | 金融級應用 |
+| **延遲** | < 5s | 跨鏈確認時間 |
+| **TVL 上限** | 建議 $50M | V2.0 擴展估值 |
+| **QPS** | 50-100 TPS | 預估用戶量增長 |
+| **跨鏈延遲** | 1-3 min | Wormhole 確認 |
+
+---
+
+## 5️⃣ 關鍵設計決策
+
+### ADR-004: 跨鏈模式選擇
+
+| 項目 | 內容 |
+|------|------|
+| **背景** | 需要支持 EVM ↔ Sui 雙向跨鏈生息 |
+| **選項** | 1. 托管模式 (Vault 持有資產)<br>2. 非托管模式 |
+| **決策** | ✅ 選項 1 (初期) |
+| **理由** | 簡單安全，用戶體驗好，適合 MVP |
+
+### ADR-005: 收益來源選擇
+
+| 項目 | 內容 |
+|------|------|
+| **背景** | 需要選擇 EVM 和 Sui 的收益來源 |
+| **選項** | 1. 單一來源<br>2. 多策略分散 |
+| **決策** | ✅ 選項 2 |
+| **理由** | 分散風險，提高收益穩定性 |
+
+### ADR-006: Relayer 選擇
+
+| 項目 | 內容 |
+|------|------|
+| **背景** | 需要選擇跨鏈消息中繼方案 |
+| **選項** | 1. Wormhole 官方 Relayer<br>2. 自建 Relayer |
+| **決策** | ✅ 選項 1 (初期) |
+| **理由** | 降低運維複雜度，快速上線 |
+
+---
+
+## 📌 下一步行動建議 (V2.0)
+
+| 優先級 | 任務 | 預期產出 |
+|--------|------|----------|
+| **P0** | 實現 `cross_chain.move` | 跨鏈消息處理 |
+| **P0** | 實現 `LanternVault.sol` | EVM 側合約 |
+| **P1** | 實現 Relayer 服務 | 跨鏈消息監聽與執行 |
+| **P1** | 升級 `yield.move` | 多策略收益 |
+| **P2** | 前端跨鏈 UI | 支持雙向跨鏈 |
+| **P2** | 測試網部署與測試 | 完整流程驗證 |
+
+---
+
+*架構版本: V2.0*
+*更新日期: 2026-02-23*

@@ -1,0 +1,61 @@
+// Prisma Schema
+// 數據庫表結構定義
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// 用戶代付記錄
+model SponsorRecord {
+  id            String   @id @default(uuid())
+  userAddress   String   @map("user_address") @db.VarChar(66)
+  depositAmount Decimal  @map("deposit_amount") @db.Decimal(20, 8)
+  ipAddress     String?  @map("ip_address") @db.Inet
+  userAgent     String?  @map("user_agent") @db.Text
+  txHash        String?  @map("tx_hash") @db.VarChar(66)
+  createdAt     DateTime @default(now()) @map("created_at")
+
+  @@index([userAddress, createdAt], name: "idx_sponsor_user_date")
+  @@map("sponsor_records")
+}
+
+// 風控攔截日誌
+model SybilBlock {
+  id         String   @id @default(uuid())
+  userAddress String? @map("user_address") @db.VarChar(66)
+  ipAddress  String?  @map("ip_address") @db.Inet
+  reason     String   @db.VarChar(50)
+  createdAt  DateTime @default(now()) @map("created_at")
+
+  @@index([ipAddress, createdAt], name: "idx_sybil_ip_date")
+  @@map("sybil_blocks")
+}
+
+// 用戶份額記錄（可選：從鏈上同步）
+model UserPosition {
+  id             String   @id @default(uuid())
+  userAddress    String   @unique @map("user_address") @db.VarChar(66)
+  shares         Decimal  @map("shares") @db.Decimal(40, 0) @default(0)
+  totalDeposited Decimal  @map("total_deposited") @db.Decimal(40, 0) @default(0)
+  totalWithdrawn Decimal  @map("total_withdrawn") @db.Decimal(40, 0) @default(0)
+  lastUpdated    DateTime @default(now()) @map("last_updated")
+
+  @@map("user_positions")
+}
+
+// APY 歷史記錄
+model ApyHistory {
+  id         String   @id @default(uuid())
+  source     String   @db.VarChar(50)
+  apy        Decimal  @db.Decimal(10, 6)
+  tvl        Decimal? @db.Decimal(40, 0)
+  recordedAt DateTime @default(now()) @map("recorded_at")
+
+  @@index([recordedAt], name: "idx_apy_recorded")
+  @@map("apy_history")
+}

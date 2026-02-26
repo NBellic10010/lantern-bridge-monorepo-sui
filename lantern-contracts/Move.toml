@@ -1,0 +1,13 @@
+[package]
+name = "lantern_vault"
+edition = "2024.beta" # Sui Move Edition
+version = "1.0.0"
+
+[dependencies]
+Sui = { git = "https://github.com/MystenLabs/sui.git", subdir = "crates/sui-framework/packages/sui-framework", rev = "framework/testnet" }
+MoveStdlib = { git = "https://github.com/MystenLabs/sui.git", subdir = "crates/sui-framework/packages/move-stdlib", rev = "framework/testnet" }
+
+[dev-dependencies]
+
+[addresses]
+lantern_vault = "0x0"
