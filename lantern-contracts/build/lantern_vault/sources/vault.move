@@ -20,6 +20,8 @@ const EPaused: u64 = 2;
 const EZeroAmount: u64 = 3;
 const EMinDepositNotMet: u64 = 4;
 const EInvalidFeeRate: u64 = 5;
+const EMaxDepositExceeded: u64 = 6;
+const EMaxWithdrawExceeded: u64 = 7;
 
 // ============================================================================
 // 事件定義
@@ -265,6 +267,25 @@ public fun get_wusdc_type<T>(vault: &Vault<T>): type_name::TypeName {
 public fun get_shares(user_pos: &UserPosition): u64 {
     user_pos.shares
 }
+
+// ============================================================================
+// 安全檢查說明
+// 
+// 為了避免循環依賴，vault 模組保持獨立。
+// 調用者（如 cross_chain）在調用 vault 函數前，應先調用 safety 模組的安全檢查：
+// 
+// 1. 存款流程:
+//    safety::deposit_safety_check(&vault, &config, amount, ctx)
+//    vault::deposit(&mut vault, &mut user_pos, coin, ctx)
+// 
+// 2. 提款流程:
+//    safety::withdraw_safety_check(&vault, &config, shares, &user_pos, ctx)
+//    vault::withdraw(&mut vault, &mut user_pos, shares, ctx)
+// 
+// 3. 滑點保護:
+//    let min_receive = safety::calculate_min_receive(shares, total_shares, total_assets, slippage_bps);
+//    vault::withdraw(...);
+//    safety::check_slippage(actual_received, min_receive);
 
 #[test_only]
 public fun create_vault_for_testing<T>(

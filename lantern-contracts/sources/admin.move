@@ -13,6 +13,10 @@ const ENotAdmin: u64 = 200;
 const EInvalidFeeRate: u64 = 201;
 const EAlreadyPaused: u64 = 202;
 const ENotPaused: u64 = 203;
+const EInvalidMaxValue: u64 = 204;
+const EInvalidTimelockDelay: u64 = 205;
+const ETimelockNotExpired: u64 = 206;
+const EInvalidRateLimit: u64 = 207;
 
 // ============================================================================
 // 結構
@@ -35,6 +39,24 @@ public struct Config has key, store {
     paused: bool,
     /// 最低存款金額（最小單位，如 1 USDC = 1000000）
     min_deposit: u64,
+    /// 最大存款金額（0 = 無限制）
+    max_deposit: u64,
+    /// 最大提款金額（0 = 無限制）
+    max_withdraw: u64,
+    /// 速率限制時間窗口（毫秒）
+    rate_limit_window: u64,
+    /// 速率限制最大次數
+    rate_limit_count: u64,
+    /// 大額交易閾值（basis points，如 1000 = 10% 總資產）
+    large_tx_threshold_bps: u64,
+    /// 時間鎖延遲（秒）
+    timelock_delay: u64,
+    /// 待生效的手續費費率（時間鎖中）
+    pending_fee_rate: u64,
+    /// 待生效的手續費歸屬地址（時間鎖中）
+    pending_treasury: address,
+    /// 時間鎖解鎖時間（Unix 時間戳，毫秒）
+    timelock_unlock_time: u64,
 }
 
 // ============================================================================
@@ -46,10 +68,19 @@ public struct Config has key, store {
 public fun initialize(ctx: &mut TxContext) {
     let config = Config {
         id: object::new(ctx),
-        fee_rate: 100,         // 默認 1%
+        fee_rate: 100,              // 默認 1%
         treasury: ctx.sender(),
         paused: false,
-        min_deposit: 1000000, // 默認 1 USDC
+        min_deposit: 1000000,       // 默認 1 USDC
+        max_deposit: 100000000,     // 默認 100 USDC (0 = 無限制)
+        max_withdraw: 100000000,    // 默認 100 USDC (0 = 無限制)
+        rate_limit_window: 3600000, // 默認 1 小時（毫秒）
+        rate_limit_count: 10,       // 默認 1 小時最多 10 次
+        large_tx_threshold_bps: 1000, // 默認 10% 總資產為大額
+        timelock_delay: 86400,      // 默認 24 小時（秒）
+        pending_fee_rate: 100,
+        pending_treasury: ctx.sender(),
+        timelock_unlock_time: 0,
     };
 
     let admin_cap = AdminCap {
@@ -110,6 +141,130 @@ public fun set_min_deposit(
     config.min_deposit = new_min;
 }
 
+/// 設定最大存款金額
+public fun set_max_deposit(
+    config: &mut Config,
+    cap: &AdminCap,
+    new_max: u64
+) {
+    verify_admin(cap);
+    assert!(new_max == 0 || new_max >= config.min_deposit, EInvalidMaxValue);
+    config.max_deposit = new_max;
+}
+
+/// 設定最大提款金額
+public fun set_max_withdraw(
+    config: &mut Config,
+    cap: &AdminCap,
+    new_max: u64
+) {
+    verify_admin(cap);
+    config.max_withdraw = new_max;
+}
+
+/// 設定速率限制
+public fun set_rate_limit(
+    config: &mut Config,
+    cap: &AdminCap,
+    window_ms: u64,
+    max_count: u64
+) {
+    verify_admin(cap);
+    assert!(window_ms > 0 && max_count > 0, EInvalidRateLimit);
+    config.rate_limit_window = window_ms;
+    config.rate_limit_count = max_count;
+}
+
+/// 設定大額交易閾值
+public fun set_large_tx_threshold(
+    config: &mut Config,
+    cap: &AdminCap,
+    threshold_bps: u64
+) {
+    verify_admin(cap);
+    // 不能超過 100% (10000 bps)
+    assert!(threshold_bps <= 10000, EInvalidMaxValue);
+    config.large_tx_threshold_bps = threshold_bps;
+}
+
+/// 設定時間鎖延遲
+public fun set_timelock_delay(
+    config: &mut Config,
+    cap: &AdminCap,
+    delay_seconds: u64
+) {
+    verify_admin(cap);
+    // 最小 1 小時，最大 7 天
+    assert!(delay_seconds >= 3600 && delay_seconds <= 604800, EInvalidTimelockDelay);
+    config.timelock_delay = delay_seconds;
+}
+
+// ============================================================================
+// 時間鎖（Timelock）- 延遲生效的參數修改
+
+/// 發起手續費費率變更（進入時間鎖）
+public fun initiate_fee_rate_change(
+    config: &mut Config,
+    cap: &AdminCap,
+    new_rate: u64,
+    ctx: &mut TxContext
+) {
+    verify_admin(cap);
+    assert!(new_rate <= 500, EInvalidFeeRate);
+
+    config.pending_fee_rate = new_rate;
+    config.timelock_unlock_time = sui::tx_context::epoch_timestamp_ms(ctx) + (config.timelock_delay * 1000);
+
+    sui::event::emit(FeeRateChangeInitiated {
+        new_rate,
+        unlock_time: config.timelock_unlock_time,
+    });
+}
+
+/// 執行手續費費率變更（時間鎖結束後）
+public fun execute_fee_rate_change(config: &mut Config, ctx: &mut TxContext) {
+    let current_time = sui::tx_context::epoch_timestamp_ms(ctx);
+    assert!(current_time >= config.timelock_unlock_time, ETimelockNotExpired);
+
+    config.fee_rate = config.pending_fee_rate;
+    config.timelock_unlock_time = 0;
+
+    sui::event::emit(FeeRateChangeExecuted {
+        new_rate: config.fee_rate,
+    });
+}
+
+/// 發起Treasury地址變更（進入時間鎖）
+public fun initiate_treasury_change(
+    config: &mut Config,
+    cap: &AdminCap,
+    new_treasury: address,
+    ctx: &mut TxContext
+) {
+    verify_admin(cap);
+
+    config.pending_treasury = new_treasury;
+    config.timelock_unlock_time = sui::tx_context::epoch_timestamp_ms(ctx) + (config.timelock_delay * 1000);
+
+    sui::event::emit(TreasuryChangeInitiated {
+        new_treasury,
+        unlock_time: config.timelock_unlock_time,
+    });
+}
+
+/// 執行Treasury地址變更（時間鎖結束後）
+public fun execute_treasury_change(config: &mut Config, ctx: &mut TxContext) {
+    let current_time = sui::tx_context::epoch_timestamp_ms(ctx);
+    assert!(current_time >= config.timelock_unlock_time, ETimelockNotExpired);
+
+    config.treasury = config.pending_treasury;
+    config.timelock_unlock_time = 0;
+
+    sui::event::emit(TreasuryChangeExecuted {
+        new_treasury: config.treasury,
+    });
+}
+
 // ============================================================================
 // 緊急控制
 
@@ -158,6 +313,46 @@ public fun get_min_deposit(config: &Config): u64 {
     config.min_deposit
 }
 
+/// 獲取最大存款金額
+public fun get_max_deposit(config: &Config): u64 {
+    config.max_deposit
+}
+
+/// 獲取最大提款金額
+public fun get_max_withdraw(config: &Config): u64 {
+    config.max_withdraw
+}
+
+/// 獲取速率限制窗口（毫秒）
+public fun get_rate_limit_window(config: &Config): u64 {
+    config.rate_limit_window
+}
+
+/// 獲取速率限制最大次數
+public fun get_rate_limit_count(config: &Config): u64 {
+    config.rate_limit_count
+}
+
+/// 獲取大額交易閾值（basis points）
+public fun get_large_tx_threshold(config: &Config): u64 {
+    config.large_tx_threshold_bps
+}
+
+/// 獲取時間鎖延遲（秒）
+public fun get_timelock_delay(config: &Config): u64 {
+    config.timelock_delay
+}
+
+/// 獲取時間鎖解鎖時間
+public fun get_timelock_unlock_time(config: &Config): u64 {
+    config.timelock_unlock_time
+}
+
+/// 檢查時間鎖是否處於激活狀態
+public fun is_timelock_active(config: &Config): bool {
+    config.timelock_unlock_time > 0
+}
+
 // ============================================================================
 // 事件
 
@@ -167,6 +362,28 @@ public struct ProtocolPaused has copy, drop {
 
 public struct ProtocolUnpaused has copy, drop {
     timestamp: u64,
+}
+
+/// 手續費費率變更已發起
+public struct FeeRateChangeInitiated has copy, drop {
+    new_rate: u64,
+    unlock_time: u64,
+}
+
+/// 手續費費率變更已執行
+public struct FeeRateChangeExecuted has copy, drop {
+    new_rate: u64,
+}
+
+/// Treasury 地址變更已發起
+public struct TreasuryChangeInitiated has copy, drop {
+    new_treasury: address,
+    unlock_time: u64,
+}
+
+/// Treasury 地址變更已執行
+public struct TreasuryChangeExecuted has copy, drop {
+    new_treasury: address,
 }
 
 // ============================================================================
@@ -183,6 +400,15 @@ public fun create_config_for_testing(
         treasury,
         paused: false,
         min_deposit: 1000000,
+        max_deposit: 100000000,
+        max_withdraw: 100000000,
+        rate_limit_window: 3600000,
+        rate_limit_count: 10,
+        large_tx_threshold_bps: 1000,
+        timelock_delay: 86400,
+        pending_fee_rate: 100,
+        pending_treasury: treasury,
+        timelock_unlock_time: 0,
     }
 }
 
