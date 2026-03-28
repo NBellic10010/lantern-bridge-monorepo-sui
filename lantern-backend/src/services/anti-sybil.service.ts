@@ -73,10 +73,10 @@ export class AntiSybilEngine {
     // 4. 持久化記錄到 PostgreSQL
     await this.db.client.sponsorRecord.create({
       data: {
-        user_address: userAddress,
-        deposit_amount: depositAmount,
-        ip_address: clientIP,
-        userAgent: '', // 從請求中獲取
+        userAddress,
+        depositAmount,
+        ipAddress: clientIP,
+        userAgent: '',
       },
     });
 
@@ -96,8 +96,8 @@ export class AntiSybilEngine {
 
     await this.db.client.sybilBlock.create({
       data: {
-        user_address: userAddress,
-        ip_address: ip,
+        userAddress,
+        ipAddress: ip,
         reason,
       },
     });

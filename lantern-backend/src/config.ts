@@ -25,6 +25,7 @@ export const config = {
   sui: {
     rpcUrl: process.env.SUI_RPC_URL || 'https://rpc.mainnet.sui.io',
     wsUrl: process.env.SUI_WS_URL,
+    vaultPackageId: process.env.SUI_VAULT_PACKAGE_ID || '0x0000000000000000000000000000000000000000000000000000000000000001',
   },
 
   // Shinami Gas Station

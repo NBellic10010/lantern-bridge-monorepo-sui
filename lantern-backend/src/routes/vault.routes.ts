@@ -2,7 +2,7 @@
  * Vault 路由 - 金庫相關接口
  */
 import { Router, Request, Response } from 'express';
-import { SuiClient } from '@mysten/sui';
+import { SuiClient } from '@mysten/sui/client';
 import { config } from '../config';
 import { logger } from '../services/logger.service';
 

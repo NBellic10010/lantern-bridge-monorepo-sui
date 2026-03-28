@@ -24,7 +24,7 @@ export class RedisService {
         host: config.redis.host,
         port: config.redis.port,
         password: config.redis.password,
-        retryStrategy: (times) => {
+        retryStrategy: (times: number) => {
           const delay = Math.min(times * 50, 2000);
           return delay;
         },
@@ -34,7 +34,7 @@ export class RedisService {
         logger.info('Redis connected');
       });
 
-      this.client.on('error', (err) => {
+      this.client.on('error', (err: Error) => {
         logger.error('Redis error:', err);
       });
 

@@ -2,12 +2,15 @@
  * Relayer Service - 跨鏈中繼服務
  * 負責處理 EVM ↔ Sui 跨鏈消息
  * 
+ * 使用 Wormhole SDK 進行跨鏈消息處理
+ * 
  * 流程:
  * 1. 監聽 Wormhole VAA
  * 2. 解析跨鏈消息
  * 3. 在目標鏈執行對應操作
  */
 import { ethers } from 'ethers';
+import { wormhole, Chain } from '@wormhole-foundation/sdk';
 import { logger } from './logger.service';
 import { RedisService } from './redis.service';
 
@@ -47,9 +50,6 @@ interface RelayerConfig {
 // ============================================================================
 // 常量
 
-const CHAIN_ID_ETHEREUM = 2;
-const CHAIN_ID_SUI = 21;
-
 const MSG_TYPE_DEPOSIT_EVM = 1;
 const MSG_TYPE_WITHDRAW_EVM = 2;
 const MSG_TYPE_DEPOSIT_SUI = 3;
@@ -68,12 +68,28 @@ export class RelayerService {
     private redis: RedisService;
     private isRunning: boolean = false;
     
+    // Chain context
+    private readonly SOURCE_CHAIN: Chain = 'Ethereum';
+    private readonly DEST_CHAIN: Chain = 'Sui';
+    
     private constructor() {
         this.config = this.loadConfig();
         this.suiProvider = new ethers.JsonRpcProvider(this.config.suiRpcUrl);
         this.evmProvider = new ethers.JsonRpcProvider(this.config.evmRpcUrl);
         this.evmWallet = new ethers.Wallet(this.config.evmPrivateKey, this.evmProvider);
         this.redis = RedisService.getInstance();
+    }
+    
+    /**
+     * 初始化 Wormhole SDK
+     */
+    private async initWormhole(): Promise<void> {
+        try {
+            logger.info('Wormhole SDK initialization skipped - using placeholder');
+        } catch (error) {
+            logger.error('Failed to initialize Wormhole SDK:', error);
+            throw error;
+        }
     }
     
     public static getInstance(): RelayerService {
@@ -270,7 +286,7 @@ export class RelayerService {
      * 1. 解析 Sui 事件
      * 2. 在 EVM 合約中執行提款
      */
-    async handleSuiToEvmWithdraw(event: any): Promise<string> {
+    async handleSuiToEvmWithdraw(event: unknown): Promise<string> {
         logger.info('Processing Sui → EVM withdraw...');
         
         // 1. 解析事件
@@ -298,8 +314,6 @@ export class RelayerService {
     private async executeSuiDeposit(message: CrossChainMessage): Promise<string> {
         // 構建 Sui PTB (Programmable Transaction Block)
         // 調用 cross_chain::receive_from_evm
-        
-        const txb = new ethers.Transaction();
         
         // 模擬實現
         // const txb = new TransactionBlock();
@@ -330,9 +344,15 @@ export class RelayerService {
      */
     private async executeEvmWithdraw(message: CrossChainMessage): Promise<string> {
         // 連接 EVM Vault 合約
-        const vault = await ethers.getContractAt(
-            'LanternVault',
+        // 使用 ethers v6 Contract 類
+        const vaultAbi = [
+            'function depositFromSui(address user, uint256 amount) external',
+            'function withdraw(address user, uint256 amount) external'
+        ];
+        
+        const vault = new ethers.Contract(
             this.config.evmVaultAddress,
+            vaultAbi,
             this.evmWallet
         );
         
@@ -362,8 +382,8 @@ export class RelayerService {
         // 模擬實現
         return {
             msgType: MSG_TYPE_DEPOSIT_EVM,
-            sourceChain: CHAIN_ID_ETHEREUM,
-            destChain: CHAIN_ID_SUI,
+            sourceChain: 2, // Ethereum
+            destChain: 21, // Sui
             user: '0x1234567890123456789012345678901234567890',
             amount: BigInt(1000000), // 1 USDC
             fee: BigInt(500), // 0.5%
@@ -374,13 +394,13 @@ export class RelayerService {
     /**
      * 解析 Sui 事件
      */
-    private parseSuiEvent(event: any): CrossChainMessage {
+    private parseSuiEvent(event: unknown): CrossChainMessage {
         // 解析 Sui 跨鏈事件
         
         return {
             msgType: MSG_TYPE_WITHDRAW_SUI,
-            sourceChain: CHAIN_ID_SUI,
-            destChain: CHAIN_ID_ETHEREUM,
+            sourceChain: 21, // Sui
+            destChain: 2, // Ethereum
             user: '0x1234567890123456789012345678901234567890',
             amount: BigInt(1000000),
             fee: BigInt(500),
@@ -410,6 +430,93 @@ export class RelayerService {
     async processMessage(vaa: string): Promise<string> {
         const vaaBuffer = Buffer.from(vaa, 'hex');
         return await this.handleEvmToSuiDeposit(vaaBuffer);
+    }
+    
+    // ============================================================================
+    // Wormhole SDK 跨鏈轉帳
+    // ============================================================================
+    
+    /**
+     * 從 EVM 轉帳到 Sui
+     * 使用 Wormhole Token Bridge
+     */
+    async transferEvmToSui(
+        tokenAddress: string,
+        amount: bigint,
+        recipientSuiAddress: string
+    ): Promise<string> {
+        logger.info(`Transferring ${amount} from EVM to Sui...`);
+        
+        // Get the source and destination chains
+        const sourceChain = this.SOURCE_CHAIN;
+        const destChain = this.DEST_CHAIN;
+        
+        logger.info(`Source chain: ${sourceChain}, Dest chain: ${destChain}`);
+        
+        // NOTE: Actual implementation would use:
+        // const wh = await wormhole('Mainnet', [Ethereum, Sui]);
+        // const transfer = await wh.token.transfer(
+        //     tokenId,
+        //     amount,
+        //     recipientSuiAddress,
+        //     destChain
+        // );
+        
+        // For now, return a simulated transaction
+        logger.info(`Transfer initiated (simulated): ${amount} to ${recipientSuiAddress}`);
+        return 'simulated-wormhole-transfer-tx';
+    }
+    
+    /**
+     * 從 Sui 轉帳到 EVM
+     */
+    async transferSuiToEvm(
+        tokenType: string,
+        amount: bigint,
+        recipientEvmAddress: string
+    ): Promise<string> {
+        logger.info(`Transferring ${amount} from Sui to EVM...`);
+        
+        // Get the source and destination chains
+        const sourceChain = this.DEST_CHAIN;
+        const destChain = this.SOURCE_CHAIN;
+        
+        logger.info(`Source chain: ${sourceChain}, Dest chain: ${destChain}`);
+        
+        // NOTE: Actual implementation would use Wormhole SDK
+        // const wh = await wormhole('Mainnet', [Sui, Ethereum]);
+        // const transfer = await wh.token.transfer(...)
+        
+        logger.info(`Transfer initiated (simulated): ${amount} to ${recipientEvmAddress}`);
+        return 'simulated-wormhole-transfer-tx';
+    }
+    
+    /**
+     * 兌換 VAA (在目標鏈)
+     */
+    async redeemVAA(vaa: Uint8Array): Promise<string> {
+        logger.info('Redeeming VAA on Sui...');
+        
+        // NOTE: Actual implementation would use:
+        // const redeemer = await this.wormhole.sui.redeem(vaa);
+        
+        return 'simulated-redeem-tx';
+    }
+    
+    /**
+     * 獲取跨鏈轉帳狀態
+     */
+    async getTransferStatus(messageId: string): Promise<{
+        status: 'pending' | 'completed' | 'failed';
+        sourceChain: string;
+        destChain: string;
+    }> {
+        // NOTE: Actual implementation would query Wormhole API
+        return {
+            status: 'pending',
+            sourceChain: 'Ethereum',
+            destChain: 'Sui',
+        };
     }
 }
 
