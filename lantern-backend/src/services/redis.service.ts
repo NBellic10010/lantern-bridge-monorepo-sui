@@ -53,7 +53,22 @@ export class RedisService {
 
   public getClient(): Redis {
     if (!this.client) {
-      throw new Error('Redis client not initialized');
+      logger.warn('Redis client not initialized, creating lazy client');
+      // Return a mock client or create a lazy connection
+      this.client = new Redis({
+        host: config.redis.host,
+        port: config.redis.port,
+        password: config.redis.password,
+        lazyConnect: true,
+        maxRetriesPerRequest: 1,
+        retryStrategy: () => null, // Disable retries
+        connectTimeout: 5000,
+      });
+      
+      // Don't wait for connection - just log warning
+      this.client.connect().catch((err) => {
+        logger.warn('Redis lazy connect failed (non-blocking)', { error: err.message });
+      });
     }
     return this.client;
   }
@@ -61,23 +76,41 @@ export class RedisService {
   // 便捷方法
 
   public async get(key: string): Promise<string | null> {
-    return this.getClient().get(key);
+    try {
+      return await this.getClient().get(key);
+    } catch (error) {
+      logger.warn('Redis get failed, returning null', { key, error });
+      return null;
+    }
   }
 
   public async set(key: string, value: string, ttlSeconds?: number): Promise<void> {
-    if (ttlSeconds) {
-      await this.getClient().setex(key, ttlSeconds, value);
-    } else {
-      await this.getClient().set(key, value);
+    try {
+      if (ttlSeconds) {
+        await this.getClient().setex(key, ttlSeconds, value);
+      } else {
+        await this.getClient().set(key, value);
+      }
+    } catch (error) {
+      logger.warn('Redis set failed', { key, error });
     }
   }
 
   public async del(key: string): Promise<void> {
-    await this.getClient().del(key);
+    try {
+      await this.getClient().del(key);
+    } catch (error) {
+      logger.warn('Redis del failed', { key, error });
+    }
   }
 
   public async incr(key: string): Promise<number> {
-    return this.getClient().incr(key);
+    try {
+      return await this.getClient().incr(key);
+    } catch (error) {
+      logger.warn('Redis incr failed, returning 0', { key, error });
+      return 0;
+    }
   }
 
   public async expire(key: string, seconds: number): Promise<void> {

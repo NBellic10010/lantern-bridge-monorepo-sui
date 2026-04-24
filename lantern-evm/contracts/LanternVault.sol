@@ -231,7 +231,7 @@ contract LanternVault is ERC20, Ownable, ReentrancyGuard {
         (address recipient, uint256 amount) = abi.decode(payload, (address, uint256));
         
         // Verify VAA (simplified - in production use proper Wormhole verification)
-        bytes32 vaaHash = keccak256(abi.encodePacked(payload, vaaSignature));
+        bytes32 vaaHash = keccak256(abi.encode(payload, vaaSignature));
         require(!consumedVAAs[vaaHash], VAAAlreadyConsumed());
         consumedVAAs[vaaHash] = true;
         

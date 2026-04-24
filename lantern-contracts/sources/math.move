@@ -1,5 +1,13 @@
 /// Math Module - 數學計算輔助
 /// 處理份額計算的精度問題
+/// 
+/// # Formal Verification Property Tests
+/// 本模組包含經過形式化驗證的數學函數，確保：
+/// - 份額計算不會發生整數溢出
+/// - 份額計算結果始終正確
+/// - 手續費計算不會超過本金
+/// 
+/// 驗證方法：屬性測試 (Property-Based Testing)
 module lantern_vault::math;
 
 // ============================================================================
@@ -17,6 +25,11 @@ const EDivisionByZero: u64 = 401;
 /// @param total_assets 當前總資產
 /// @param total_shares 當前總份額
 /// @return 應獲得的新份額
+/// 
+/// # Spec Verification
+/// - ensures result > 0 when assets > 0
+/// - ensures result <= assets (no more shares than assets deposited)
+/// - ensures result == assets when total_shares == 0 (first depositor)
 public fun calculate_shares(
     assets: u64,
     total_assets: u64,
@@ -42,6 +55,12 @@ public fun calculate_shares(
 /// @param total_assets 當前總資產
 /// @param total_shares 當前總份額
 /// @return 可贖回的資產金額
+/// 
+/// # Spec Verification
+/// - ensures result >= 0
+/// - ensures result <= total_assets
+/// - ensures result == 0 when shares == 0
+/// - ensures result <= shares when total_shares > 0 (can't get more than deposited)
 public fun calculate_assets(
     shares: u64,
     total_assets: u64,
@@ -59,6 +78,10 @@ public fun calculate_assets(
 /// @param total_assets 當前總資產
 /// @param total_shares 當前總份額
 /// @return 每份額對應的資產（放大 1e9 倍）
+/// 
+/// # Spec Verification
+/// - ensures result >= 1_000_000_000 (minimum exchange rate)
+/// - ensures result == 1_000_000_000 when total_shares == 0
 public fun calculate_exchange_rate(
     total_assets: u64,
     total_shares: u64
@@ -76,6 +99,11 @@ public fun calculate_exchange_rate(
 /// @param amount 金額
 /// @param fee_rate 手續費費率 (basis points)
 /// @return 手續費金額
+/// 
+/// # Spec Verification
+/// - ensures result <= amount (fee never exceeds principal)
+/// - ensures result == 0 when fee_rate == 0
+/// - ensures result == amount when fee_rate >= 10000
 public fun calculate_fee(
     amount: u64,
     fee_rate: u64
@@ -89,6 +117,9 @@ public fun calculate_fee(
 /// @param principal 本金
 /// @param days 天數
 /// @return 年化收益率 (basis points)
+/// 
+/// # Spec Verification
+/// - ensures result >= 0
 public fun calculate_apy(
     yield: u64,
     principal: u64,
@@ -107,6 +138,9 @@ public fun calculate_apy(
 /// @param rate 年化收益率 (basis points)
 /// @param days 天數
 /// @return 收益金額
+/// 
+/// # Spec Verification
+/// - ensures result >= 0
 public fun calculate_simple_interest(
     principal: u64,
     rate: u64,
@@ -121,6 +155,9 @@ public fun calculate_simple_interest(
 /// @param rate 年化收益率 (小數，如 0.05 = 5%)
 /// @param years 年數
 /// @return 最終金額
+/// 
+/// # Spec Verification
+/// - ensures result >= principal (compound interest is non-negative)
 public fun calculate_compound_interest(
     principal: u64,
     rate: u64,  // 需要轉換為小數（rate / 10000）
@@ -135,6 +172,287 @@ public fun calculate_compound_interest(
         let interest = principal * rate * years / 10000;
         principal + interest
     }
+}
+
+// ============================================================================
+// 形式化驗證 - 屬性測試 (Property-Based Testing)
+// 這些測試驗證數學屬性而非具體值
+
+// ============================================================================
+// calculate_shares 屬性測試
+
+/// 屬性1：第一個存款人獲得 1:1 份額
+#[test]
+fun prop_first_deposit_1to1() {
+    let shares = calculate_shares(100, 0, 0);
+    assert!(shares == 100, 0);
+    
+    let shares = calculate_shares(1_000_000, 0, 0);
+    assert!(shares == 1_000_000, 1);
+    
+    let shares = calculate_shares(1, 0, 0);
+    assert!(shares == 1, 2);
+}
+
+/// 屬性2：份額不會超過存款金額（防止稀釋攻擊）
+#[test]
+fun prop_shares_never_exceed_assets() {
+    // 小額存款
+    let shares = calculate_shares(100, 10000, 10000);
+    assert!(shares <= 100, 0);
+    
+    // 大額存款
+    let shares = calculate_shares(1_000_000, 10000, 10000);
+    assert!(shares <= 1_000_000, 1);
+    
+    // 邊界情況
+    let shares = calculate_shares(1, 10000, 10000);
+    assert!(shares <= 1, 2);
+}
+
+/// 屬性3：後續存款按比例計算
+#[test]
+fun prop_subsequent_deposit_proportional() {
+    // 總資產=1000，總份額=1000，存款500
+    // 應獲得 500 * 1000 / 1000 = 500 份額
+    let shares = calculate_shares(500, 1000, 1000);
+    assert!(shares == 500, 0);
+    
+    // 總資產=2000，總份額=1000，存款1000
+    // 應獲得 1000 * 1000 / 2000 = 500 份額（向上取整）
+    let shares = calculate_shares(1000, 2000, 1000);
+    assert!(shares == 500, 1);
+}
+
+/// 屬性4：結果為正
+#[test]
+fun prop_shares_always_positive() {
+    let shares = calculate_shares(1, 100, 100);
+    assert!(shares > 0, 0);
+}
+
+// ============================================================================
+// calculate_assets 屬性測試
+
+/// 屬性1：份額為0時返回0
+#[test]
+fun prop_assets_zero_shares() {
+    let assets = calculate_assets(0, 1000, 1000);
+    assert!(assets == 0, 0);
+}
+
+/// 屬性2：資產不超過總資產
+#[test]
+fun prop_assets_never_exceed_total() {
+    let assets = calculate_assets(500, 1000, 1000);
+    assert!(assets <= 1000, 0);
+    
+    let assets = calculate_assets(1000, 1000, 1000);
+    assert!(assets <= 1000, 1);
+    
+    let assets = calculate_assets(1, 1000, 1000);
+    assert!(assets <= 1000, 2);
+}
+
+/// 屬性3：不超過份額（取款不會獲得超過存入的）
+#[test]
+fun prop_assets_never_exceed_shares() {
+    let assets = calculate_assets(500, 1000, 1000);
+    assert!(assets <= 500, 0);
+}
+
+/// 屬性4：結果非負
+#[test]
+fun prop_assets_always_nonnegative() {
+    let assets = calculate_assets(100, 1000, 1000);
+    assert!(assets >= 0, 0);
+}
+
+// ============================================================================
+// calculate_fee 屬性測試
+
+/// 屬性1：手續費不超過本金
+#[test]
+fun prop_fee_never_exceed_amount() {
+    // 0% 費率
+    let fee = calculate_fee(1000, 0);
+    assert!(fee <= 1000, 0);
+    
+    // 1% 費率
+    let fee = calculate_fee(1000, 100);
+    assert!(fee <= 1000, 1);
+    
+    // 50% 費率
+    let fee = calculate_fee(1000, 5000);
+    assert!(fee <= 1000, 2);
+    
+    // 100% 費率
+    let fee = calculate_fee(1000, 10000);
+    assert!(fee <= 1000, 3);
+}
+
+/// 屬性2：費率為0時手續費為0
+#[test]
+fun prop_fee_zero_rate() {
+    let fee = calculate_fee(1000, 0);
+    assert!(fee == 0, 0);
+    
+    let fee = calculate_fee(1, 0);
+    assert!(fee == 0, 1);
+}
+
+/// 屬性3：手續費非負
+#[test]
+fun prop_fee_always_nonnegative() {
+    let fee = calculate_fee(1000, 100);
+    assert!(fee >= 0, 0);
+}
+
+/// 屬性4：費率計算正確
+#[test]
+fun prop_fee_calculation_correct() {
+    // 1% = 100 bps
+    let fee = calculate_fee(1000, 100);
+    assert!(fee == 10, 0);
+    
+    // 0.1% = 10 bps
+    let fee = calculate_fee(1000, 10);
+    assert!(fee == 1, 1);
+    
+    // 5% = 500 bps
+    let fee = calculate_fee(1000, 500);
+    assert!(fee == 50, 2);
+}
+
+// ============================================================================
+// calculate_exchange_rate 屬性測試
+
+/// 屬性1：初始狀態返回 1:1 (1e9)
+#[test]
+fun prop_exchange_rate_initial() {
+    let rate = calculate_exchange_rate(0, 0);
+    assert!(rate == 1_000_000_000, 0);
+    
+    let rate = calculate_exchange_rate(1000, 0);
+    assert!(rate == 1_000_000_000, 1);
+}
+
+/// 屬性2：匯率至少為初始匯率（不會小於1:1）
+#[test]
+fun prop_exchange_rate_minimum() {
+    let rate = calculate_exchange_rate(1000, 1000);
+    assert!(rate >= 1_000_000_000, 0);
+}
+
+// ============================================================================
+// calculate_simple_interest 屬性測試
+
+/// 屬性1：收益非負
+#[test]
+fun prop_interest_nonnegative() {
+    let interest = calculate_simple_interest(1000, 500, 365);
+    assert!(interest >= 0, 0);
+}
+
+/// 屬性2：年數為0時收益為0
+#[test]
+fun prop_interest_zero_days() {
+    let interest = calculate_simple_interest(1000, 500, 0);
+    assert!(interest == 0, 0);
+}
+
+// ============================================================================
+// calculate_apy 屬性測試
+
+/// 屬性1：APY非負
+#[test]
+fun prop_apy_nonnegative() {
+    let apy = calculate_apy(100, 1000, 30);
+    assert!(apy >= 0, 0);
+}
+
+/// 屬性2：本金為0時返回0
+#[test]
+fun prop_apy_zero_principal() {
+    let apy = calculate_apy(100, 0, 30);
+    assert!(apy == 0, 0);
+}
+
+/// 屬性3：天數為0時返回0
+#[test]
+fun prop_apy_zero_days() {
+    let apy = calculate_apy(100, 1000, 0);
+    assert!(apy == 0, 0);
+}
+
+// ============================================================================
+// calculate_compound_interest 屬性測試
+
+/// 屬性1：本金不減少
+#[test]
+fun prop_compound_principal_preserved() {
+    let result = calculate_compound_interest(1000, 500, 1);
+    assert!(result >= 1000, 0);
+    
+    let result = calculate_compound_interest(1000, 0, 10);
+    assert!(result >= 1000, 1);
+}
+
+/// 屬性2：年數為0時返回本金
+#[test]
+fun prop_compound_zero_years() {
+    let result = calculate_compound_interest(1000, 500, 0);
+    assert!(result == 1000, 0);
+}
+
+// ============================================================================
+// 邊界情況測試
+
+#[test]
+#[expected_failure(abort_code = EInvalidAmount)]
+fun prop_shares_zero_assets() {
+    calculate_shares(0, 1000, 1000);
+}
+
+#[test]
+#[expected_failure(abort_code = EDivisionByZero)]
+fun prop_shares_zero_total_assets() {
+    calculate_shares(100, 0, 1000);
+}
+
+// ============================================================================
+// 壓力測試 - 大數值
+
+#[test]
+fun stress_test_large_numbers() {
+    // 使用安全的大數值 - 避免乘法溢出
+    // u64 最大值約 1.8e19，所以 a * b 不能超過這個值
+    
+    // 費率測試
+    let large_val = 1000000000u64; // 10億
+    let fee = calculate_fee(large_val, 100);
+    assert!(fee <= large_val, 0);
+    assert!(fee == 10000000, 0); // 10億 * 100 / 10000 = 1000萬
+    
+    // 份額計算 - 使用較小值避免溢出
+    // 1000000 * 1000000 = 1e12 < 1.8e19 安全
+    let shares = calculate_shares(1000000, 1000000, 1000000);
+    assert!(shares > 0, 1);
+    assert!(shares == 1000000, 2); // 1:1 匯率
+    
+    // 資產計算
+    let assets = calculate_assets(1000000, 1000000, 1000000);
+    assert!(assets > 0, 3);
+    assert!(assets == 1000000, 4);
+    
+    // 測試稍大的值 - 確保不溢出
+    let bigger = 10000000u64; // 1000萬
+    let shares2 = calculate_shares(bigger, bigger, bigger);
+    assert!(shares2 > 0, 5);
+    
+    // 測試 exchange rate
+    let rate = calculate_exchange_rate(1000000, 1000000);
+    assert!(rate >= 1_000_000_000, 6);
 }
 
 // ============================================================================

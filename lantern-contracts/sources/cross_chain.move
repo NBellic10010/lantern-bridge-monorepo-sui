@@ -9,6 +9,15 @@
 /// 1. 驗證 Relayer 權限
 /// 2. 處理存款/提款邏輯
 /// 3. 發送事件供 Relayer 監聽
+/// 
+/// 支持的代幣:
+/// - USDC: 存入 Navi 生息
+/// - suiUSDe: 持有即自動獲得 Ethena 收益 (~10-15% APY)
+/// 
+/// NTT 集成 (v2.0):
+/// - 支持 Wormhole NTT 2.0 Native Token Transfer
+/// - Burning Mode: 源鏈 burn, 目標鏈 mint
+/// - 內置速率限制和排隊機制
 module lantern_vault::cross_chain {
 
     use sui::object::{UID, ID};
@@ -71,6 +80,69 @@ module lantern_vault::cross_chain {
         dest_chain: u16,
         user: address,
         amount: u64,
+        token_type: u8, // 1 = USDC, 2 = suiUSDe
+        timestamp: u64,
+    }
+
+    /// 接收 suiUSDe 事件 (持有即生息)
+    public struct SuiUSDeDepositEvent has copy, drop {
+        user: address,
+        amount: u64,
+        message_hash: vector<u8>,
+        yield_mode: bool, // true = 持有生息, false = 存入 Navi
+        timestamp: u64,
+    }
+
+    // ============================================================================
+    // NTT Events (v2.0 新增)
+    // ============================================================================
+
+    /// NTT 轉賬發起事件 (Sui → EVM)
+    /// 用於 NTT 模式的跨鏈轉賬
+    public struct NttOutboundEvent has copy, drop {
+        /// 消息序列號 (NTT 分配)
+        sequence: u64,
+        /// 代幣地址
+        token: address,
+        /// 金額
+        amount: u64,
+        /// 目標鏈 ID
+        dest_chain: u16,
+        /// 目標地址 (Wormhole 格式)
+        recipient: vector<u8>,
+        /// 發送者
+        sender: address,
+        /// 模式 (0 = locking, 1 = burning)
+        mode: u8,
+        /// 時間戳
+        timestamp: u64,
+    }
+
+    /// NTT 轉賬接收事件 (EVM → Sui)
+    public struct NttInboundEvent has copy, drop {
+        /// 消息序列號
+        sequence: u64,
+        /// 代幣地址
+        token: address,
+        /// 金額
+        amount: u64,
+        /// 源鏈 ID
+        source_chain: u16,
+        /// 發送者
+        sender: address,
+        /// 接收者
+        recipient: address,
+        /// 時間戳
+        timestamp: u64,
+    }
+
+    /// NTT 轉賬排隊事件 (觸發速率限制)
+    public struct NttQueuedEvent has copy, drop {
+        sequence: u64,
+        token: address,
+        amount: u64,
+        dest_chain: u16,
+        release_time: u64,
         timestamp: u64,
     }
 
@@ -81,8 +153,10 @@ module lantern_vault::cross_chain {
     const CHAIN_ID_ETHEREUM: u16 = 2;
     /// Chain ID - Sui
     const CHAIN_ID_SUI: u16 = 21;
+    /// Chain ID - Arbitrum
+    const CHAIN_ID_ARBITRUM: u16 = 23;
 
-    /// Message Type - Deposit from EVM
+    /// Message Type - Deposit from EVM (USDC → lUSDC)
     const MSG_TYPE_DEPOSIT_EVM: u8 = 1;
     /// Message Type - Withdraw to EVM
     const MSG_TYPE_WITHDRAW_EVM: u8 = 2;
@@ -90,6 +164,24 @@ module lantern_vault::cross_chain {
     const MSG_TYPE_DEPOSIT_SUI: u8 = 3;
     /// Message Type - Withdraw to Sui
     const MSG_TYPE_WITHDRAW_SUI: u8 = 4;
+    /// Message Type - Deposit suiUSDe from EVM (持有即生息)
+    const MSG_TYPE_DEPOSIT_SUI_USDE: u8 = 5;
+
+    // ============================================================================
+    // NTT 常量 (v2.0 新增)
+    // ============================================================================
+
+    /// NTT 模式 - Locking (源鏈鎖定，目標鏈解鎖)
+    const NTT_MODE_LOCKING: u8 = 0;
+    /// NTT 模式 - Burning (源鏈銷毀，目標鏈鑄造)
+    const NTT_MODE_BURNING: u8 = 1;
+
+    // ============================================================================
+    // 代幣地址常量
+
+    /// suiUSDe 代幣地址 (Mainnet)
+    /// 0x41d587e5336f1c86cad50d38a7136db99333bb9bda91cea4ba69115defeb1402::sui_usde::SUI_USDE
+    const SUI_USDE_ADDRESS: address = @0x41d587e5336f1c86cad50d38a7136db99333bb9bda91cea4ba69115defeb1402;
 
     // ============================================================================
     // 錯誤碼
@@ -100,6 +192,8 @@ module lantern_vault::cross_chain {
     const EInsufficientBalance: u64 = 1003;
     const EInvalidAmount: u64 = 1004;
     const ENotRelayer: u64 = 1005;
+    const EInvalidSequence: u64 = 1006;
+    const EInvalidMode: u64 = 1007;
 
     // ============================================================================
     // 結構
@@ -391,6 +485,87 @@ module lantern_vault::cross_chain {
     }
 
     // ============================================================================
+    // suiUSDe 代幣處理 (持有即生息)
+
+    /// 處理來自 EVM 的 suiUSDe 跨鏈存款
+    /// 
+    /// 流程:
+    /// 1. Relayer 檢測到 Wormhole VAA (攜帶 suiUSDe)
+    /// 2. 解析 VAA payload
+    /// 3. 直接將 suiUSDe 轉給用戶 (用戶持有即自動生息)
+    /// 
+    /// 注意: suiUSDe 是內置生息代幣，持有即自動獲得 Ethena 收益
+    /// 不需要存入 Navi，節省 Gas
+    public fun receive_sui_usde_from_evm(
+        config: &CrossChainConfig,
+        processed: &mut ProcessedMessages,
+        amount: u64,
+        user: address,
+        message_hash: vector<u8>,
+        ctx: &mut TxContext
+    ) {
+        // 1. 驗證跨鏈功能是否啟用
+        assert!(config.enabled, EInvalidChain);
+
+        // 2. 驗證 Relayer 權限
+        let relayer = sender(ctx);
+        assert!(vector::contains(&config.relayers, &relayer), ENotRelayer);
+
+        // 3. 防重放攻擊檢查
+        assert!(!is_message_processed(processed, &message_hash), EMessageAlreadyProcessed);
+        vector::push_back(&mut processed.hashes, message_hash);
+
+        // 4. 驗證金額
+        assert!(amount > 0, EInvalidAmount);
+
+        // 5. 發送事件 - Relayer 會將 suiUSDe 直接轉給用戶
+        sui::event::emit(SuiUSDeDepositEvent {
+            user,
+            amount,
+            message_hash,
+            yield_mode: true, // 持有生息
+            timestamp: sui::tx_context::epoch_timestamp_ms(ctx),
+        });
+    }
+
+    /// 處理來自 Sui 鏈上其他來源的 suiUSDe 存款 (本地質押)
+    /// 
+    /// 用戶可以直接將 suiUSDe 質押到合約中記錄，余額變更由合約追蹤
+    public fun stake_sui_usde_for_yield<T>(
+        vault: &mut Vault<T>,
+        user_pos: &mut UserPosition,
+        amount: u64,
+        ctx: &mut TxContext
+    ) {
+        assert!(amount > 0, EInvalidAmount);
+
+        // 計算份額 (按 1:1 計算)
+        let shares = amount;
+
+        // 更新用戶份額
+        lantern_vault::vault::add_shares(user_pos, shares);
+
+        // 發送事件
+        sui::event::emit(SuiUSDeDepositEvent {
+            user: sender(ctx),
+            amount,
+            message_hash: vector::empty<u8>(), // 本地交易無 message_hash
+            yield_mode: true,
+            timestamp: sui::tx_context::epoch_timestamp_ms(ctx),
+        });
+    }
+
+    /// 獲取 suiUSDe 代幣地址
+    public fun get_sui_usde_address(): address {
+        SUI_USDE_ADDRESS
+    }
+
+    /// 檢查地址是否為 suiUSDe 代幣
+    public fun is_sui_usde(token_address: address): bool {
+        token_address == SUI_USDE_ADDRESS
+    }
+
+    // ============================================================================
     // 輔助函數
 
     /// 檢查消息是否已被處理
@@ -470,6 +645,32 @@ module lantern_vault::cross_chain {
         sui::address::from_bytes(*bytes)
     }
 
+    /// 獲取代幣類型描述
+    /// 
+    /// 返回:
+    /// - 1: USDC (存入 Navi 生息)
+    /// - 2: suiUSDe (持有即生息)
+    public fun get_token_type_name(token_type: u8): vector<u8> {
+        if (token_type == 1) {
+            b"USDC"
+        } else if (token_type == 2) {
+            b"suiUSDe"
+        } else {
+            b"Unknown"
+        }
+    }
+
+    /// 獲取代幣類型的收益模式描述
+    public fun get_yield_mode_description(token_type: u8): vector<u8> {
+        if (token_type == 1) {
+            b"USDC: 存入 Navi 借贷协议 (~5-8% APY)"
+        } else if (token_type == 2) {
+            b"suiUSDe: 持有即自动获得 Ethena 收益 (~10-15% APY)"
+        } else {
+            b"Unknown token type"
+        }
+    }
+
     /// 解碼跨鏈消息 payload
     /// 注意: 此函數僅用於測試，生產環境需要完善的位元組處理
     #[test_only]
@@ -540,7 +741,176 @@ module lantern_vault::cross_chain {
     }
 
     // ============================================================================
-    // 測試輔助
+    // NTT Integration Functions (v2.0 新增)
+    // ============================================================================
+
+    /// 发起 NTT 跨链转账 (Sui → EVM)
+    /// 
+    /// 流程:
+    /// 1. 验证参数和权限
+    /// 2. 计算份额
+    /// 3. 发出 NTTOutboundEvent 供 Relayer 监听
+    /// 4. Relayer 调用 NttManager.publishMessage() 完成跨链
+    /// 
+    /// 注意: 此函数不直接调用 NttManager，而是通过事件触发 Relayer
+    /// 
+    /// @param vault - Vault 配置
+    /// @param config - 跨链配置
+    /// @param user_pos - 用户头寸
+    /// @param share_amount - 份额数量
+    /// @param dest_chain - 目标链 Wormhole Chain ID
+    /// @param recipient - 目标地址 (Wormhole 格式)
+    /// @param mode - NTT 模式 (0 = locking, 1 = burning)
+    /// @param ctx - 交易上下文
+    /// @return 实际转账金额
+    public fun ntt_withdraw_to_evm<T>(
+        vault: &mut Vault<T>,
+        config: &CrossChainConfig,
+        user_pos: &mut UserPosition,
+        share_amount: u64,
+        dest_chain: u16,
+        recipient: address,
+        mode: u8,
+        ctx: &mut TxContext
+    ): u64 {
+        // 1. 验证目标链 (目前支持 Ethereum 和 Arbitrum)
+        assert!(
+            dest_chain == CHAIN_ID_ETHEREUM || dest_chain == CHAIN_ID_ARBITRUM,
+            EInvalidChain
+        );
+        assert!(config.enabled, EInvalidChain);
+        
+        // 2. 验证 NTT 模式
+        assert!(mode == NTT_MODE_LOCKING || mode == NTT_MODE_BURNING, EInvalidMode);
+
+        // 3. 计算可赎回金额
+        let amount = lantern_vault::vault::burn_shares(vault, user_pos, share_amount);
+
+        // 4. 计算手续费
+        let fee = (amount * 50) / 10000; // 0.5%
+        let net_amount = amount - fee;
+
+        // 5. 发送事件 - Relayer 监听此事件并调用 NttManager
+        sui::event::emit(NttOutboundEvent {
+            sequence: generate_ntt_sequence(ctx),
+            token: @0x0, // 代币地址由 Relayer 确定
+            amount: net_amount,
+            dest_chain,
+            recipient: address_to_wormhole_bytes(recipient),
+            sender: sender(ctx),
+            mode,
+            timestamp: sui::tx_context::epoch_timestamp_ms(ctx),
+        });
+
+        net_amount
+    }
+
+    /// 接收 NTT 跨链转账 (EVM → Sui)
+    /// 
+    /// 流程:
+    /// 1. Relayer 验证 VAA 签名
+    /// 2. Relayer 调用此函数
+    /// 3. Mint lUSDC 给用户
+    /// 
+    /// @param vault - Vault 配置
+    /// @param config - 跨链配置
+    /// @param processed - 消息处理记录
+    /// @param user_pos - 用户头寸
+    /// @param sequence - NTT 消息序列号
+    /// @param amount - 转账金额
+    /// @param source_chain - 源链 Wormhole Chain ID
+    /// @param sender - 发送者地址 (Wormhole 格式)
+    /// @param user - 接收者 Sui 地址
+    /// @param ctx - 交易上下文
+    public fun ntt_receive_from_evm<T>(
+        vault: &mut Vault<T>,
+        config: &CrossChainConfig,
+        processed: &mut ProcessedMessages,
+        user_pos: &mut UserPosition,
+        sequence: u64,
+        amount: u64,
+        source_chain: u16,
+        sender_bytes: vector<u8>,
+        user: address,
+        ctx: &mut TxContext
+    ) {
+        // 1. 验证跨链功能是否启用
+        assert!(config.enabled, EInvalidChain);
+
+        // 2. 验证 Relayer 权限
+        let relayer = sender(ctx);
+        assert!(vector::contains(&config.relayers, &relayer), ENotRelayer);
+
+        // 3. 防重放攻击检查
+        let msg_hash = encode_sequence_to_hash(sequence, source_chain);
+        assert!(
+            !is_message_processed(processed, &msg_hash),
+            EMessageAlreadyProcessed
+        );
+        vector::push_back(&mut processed.hashes, msg_hash);
+
+        // 4. 验证金额
+        assert!(amount > 0, EInvalidAmount);
+
+        // 5. 计算份额并 mint
+        let shares = lantern_vault::vault::mint_shares(vault, amount, ctx);
+
+        // 6. 更新用户份额
+        lantern_vault::vault::add_shares(user_pos, shares);
+
+        // 7. 发送事件
+        sui::event::emit(NttInboundEvent {
+            sequence,
+            token: @0x0,
+            amount,
+            source_chain,
+            sender: wormhole_bytes_to_address(&sender_bytes),
+            recipient: user,
+            timestamp: sui::tx_context::epoch_timestamp_ms(ctx),
+        });
+    }
+
+    // ============================================================================
+    // Helper Functions for NTT
+    // ============================================================================
+
+    /// 生成 NTT 序列号
+    fun generate_ntt_sequence(ctx: &TxContext): u64 {
+        sui::tx_context::epoch(ctx) * 1_000_000 + sui::tx_context::tx_counter(ctx)
+    }
+
+    /// 将 Sui 地址转换为 Wormhole 格式 (32 bytes)
+    fun address_to_wormhole_bytes(addr: address): vector<u8> {
+        sui::address::to_bytes(addr)
+    }
+
+    /// 将 Wormhole 格式转换为 Sui 地址
+    fun wormhole_bytes_to_address(bytes: &vector<u8>): address {
+        assert!(vector::length(bytes) == 32, 1);
+        sui::address::from_bytes(*bytes)
+    }
+
+    /// 将序列号和源链编码为消息哈希
+    fun encode_sequence_to_hash(sequence: u64, source_chain: u16): vector<u8> {
+        let mut hash = vector::empty<u8>();
+        
+        // 编码序列号 (8 bytes)
+        let mut i = 0;
+        while (i < 8) {
+            vector::push_back(&mut hash, ((sequence >> (i * 8)) as u8));
+            i = i + 1;
+        };
+        
+        // 编码源链 (2 bytes)
+        vector::push_back(&mut hash, ((source_chain) as u8));
+        vector::push_back(&mut hash, ((source_chain >> 8) as u8));
+        
+        hash
+    }
+
+    // ============================================================================
+    // Test Helper Functions
+    // ============================================================================
 
     #[test_only]
     public fun create_cross_chain_config_for_testing(

@@ -6,6 +6,17 @@ version = "1.0.0"
 [dependencies]
 Sui = { git = "https://github.com/MystenLabs/sui.git", subdir = "crates/sui-framework/packages/sui-framework", rev = "framework/mainnet" }
 MoveStdlib = { git = "https://github.com/MystenLabs/sui.git", subdir = "crates/sui-framework/packages/move-stdlib", rev = "framework/mainnet" }
+# Pyth Oracle - for price feeds (TVL calculation, yield verification)
+Pyth = { git = "https://github.com/pyth-network/pyth-crosschain.git", subdir = "target_chains/sui/contracts", rev = "sui-contract-mainnet-3" }
+
+# Wormhole NTT (Native Token Transfer) - Sui integration
+# Reference: https://github.com/wormhole-foundation/native-token-transfers
+# NTT Sui package provides NttManager, Transceiver, and related token transfer logic
+Wormhole = { git = "https://github.com/wormhole-foundation/wormhole.git", subdir = "sui/", rev = "daily/2025-01-08" }
+
+# NTT Native Token Transfer - Sui package
+# Provides NttManager, WormholeTransceiver, and token transfer capabilities
+Ntt = { git = "https://github.com/wormhole-foundation/native-token-transfers.git", subdir = "sui/" }
 
 [dev-dependencies]
 

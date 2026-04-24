@@ -27,6 +27,37 @@ interface CrossChainMessage {
     timestamp: number;
 }
 
+/**
+ * 跨鏈轉賬請求接口
+ */
+interface CrossChainRequest {
+    sourceChain: 'Arbitrum' | 'Sui';
+    destChain: 'Arbitrum' | 'Sui';
+    amount: bigint;
+    sender: string;
+    recipient: string;
+    sourceToken: 'USDC' | 'suiUSDe';
+    destToken?: 'USDC' | 'suiUSDe'; // 預設與 sourceToken 相同
+    yieldMode?: 'yield' | 'no_yield';
+}
+
+/**
+ * 跨鏈轉賬響應接口
+ */
+interface CrossChainResponse {
+    success: boolean;
+    txHash?: string;
+    messageId?: string;
+    sourceToken: string;
+    destToken: string;
+    destTokenYieldInfo?: {
+        token: 'suiUSDe';
+        estimatedAPY: number;
+        description: string;
+    };
+    message?: string;
+}
+
 interface RelayerConfig {
     // Sui 配置
     suiRpcUrl: string;
@@ -54,6 +85,42 @@ const MSG_TYPE_DEPOSIT_EVM = 1;
 const MSG_TYPE_WITHDRAW_EVM = 2;
 const MSG_TYPE_DEPOSIT_SUI = 3;
 const MSG_TYPE_WITHDRAW_SUI = 4;
+
+// ============================================================================
+// NTT 常量 (v2.0)
+
+/**
+ * Wormhole Chain IDs
+ */
+export const WORMHOLE_CHAIN_ID = {
+    Ethereum: 2,
+    Sui: 21,
+    Arbitrum: 23,
+    Optimism: 24,
+    Base: 30,
+} as const;
+
+/**
+ * NTT 模式
+ */
+export const NTT_MODE = {
+    LOCKING: 0,
+    BURNING: 1,
+} as const;
+
+/**
+ * NTT 默認配置
+ */
+export const NTT_DEFAULTS = {
+    // 默認速率限制窗口 (秒)
+    RATE_LIMIT_WINDOW: 3600, // 1 小時
+    // 默認最大流出量
+    MAX_OUTFLOW: BigInt(100_000_000_000), // 100M (假設 6 decimals)
+    // 默認 Gas 限制
+    GAS_LIMIT: BigInt(500000),
+    // 確認塊數
+    CONFIRMATIONS: 3,
+} as const;
 
 // ============================================================================
 // Relayer 服務類
@@ -409,6 +476,149 @@ export class RelayerService {
     }
     
     // ============================================================================
+    // NTT 跨鏈轉帳 (新版)
+    // ============================================================================
+    
+    /**
+     * 使用 NTT 進行跨鏈轉帳
+     * 
+     * @param sourceChain 源鏈
+     * @param destChain 目標鏈
+     * @param amount 轉帳金額
+     * @param sender 發送者地址
+     * @param recipient 接收者地址
+     * @param sourceToken 源代幣: 'USDC' | 'suiUSDe'
+     * @param yieldMode 生息模式:
+     *   - 'yield': 生息跨鏈 - 持有 suiUSDe 自動收益 / USDC 存入 Navi
+     *   - 'no_yield': 非生息跨鏈 - 資產直接轉入用戶錢包
+     */
+    async transferWithNTT(
+        sourceChain: 'Arbitrum' | 'Sui',
+        destChain: 'Arbitrum' | 'Sui',
+        amount: bigint,
+        sender: string,
+        recipient: string,
+        sourceToken: 'USDC' | 'suiUSDe',
+        yieldMode: 'yield' | 'no_yield'
+    ): Promise<CrossChainResponse> {
+        // 延遲導入避免循環依賴
+        const { NttTransferService, YieldMode } = require('./ntt-transfer.service');
+        
+        const nttService = NttTransferService.getInstance();
+        
+        // 轉換為 enum 值
+        const nttYieldMode = yieldMode === 'yield' 
+            ? YieldMode.YIELD 
+            : YieldMode.NO_YIELD;
+        
+        // 目標代幣與源代幣相同
+        const destToken = sourceToken;
+        
+        try {
+            const result = await nttService.initiateTransfer({
+                sourceChain,
+                destChain,
+                amount,
+                sender,
+                recipient,
+                token: sourceToken,
+                yieldMode: nttYieldMode,
+            });
+            
+            logger.info('NTT transfer initiated', {
+                sourceChain,
+                destChain,
+                amount: amount.toString(),
+                sourceToken,
+                destToken,
+                yieldMode,
+                messageId: result.messageId,
+            });
+            
+            return {
+                success: true,
+                txHash: result.txHash,
+                messageId: result.messageId,
+                sourceToken: result.sourceToken,
+                destToken: result.destToken,
+                destTokenYieldInfo: result.destTokenYieldInfo,
+                message: this.getYieldModeMessage(nttYieldMode, destToken),
+            };
+            
+        } catch (error) {
+            logger.error('NTT transfer failed', { error });
+            return {
+                success: false,
+                sourceToken,
+                destToken,
+                message: `轉帳失敗: ${error}`,
+            };
+        }
+    }
+    
+    /**
+     * 根據生息模式和代幣獲取描述消息
+     */
+    private getYieldModeMessage(yieldMode: string, token?: string): string {
+        const { YieldMode } = require('./ntt-transfer.service');
+        
+        // suiUSDe 內置生息
+        if (token === 'suiUSDe') {
+            return '跨鏈已完成。suiUSDe 已轉入您的錢包，Ethena 收益將自動累計 (~10-15% APY)。';
+        }
+        
+        switch (yieldMode) {
+            case YieldMode?.YIELD:
+                return '生息跨鏈已完成。您的資產已存入 Navi 借貸協議，利息將自動累計。';
+            case YieldMode?.NO_YIELD:
+                return '非生息跨鏈已完成。資產已直接轉入您的錢包。';
+            default:
+                return '跨鏈轉賬已完成。';
+        }
+    }
+    
+    /**
+     * 查詢跨鏈轉賬狀態
+     */
+    async getNttTransferStatus(messageId: string): Promise<{
+        status: string;
+        yieldMode: string;
+        sourceToken: string;
+        destToken: string;
+        description: string;
+        yieldInfo?: {
+            isYieldBearing: boolean;
+            estimatedAPY: number;
+        };
+    } | null> {
+        const { NttTransferService, YieldMode } = require('./ntt-transfer.service');
+        
+        const nttService = NttTransferService.getInstance();
+        const receipt = await nttService.getTransferStatus(messageId);
+        
+        if (!receipt) {
+            return null;
+        }
+        
+        // 獲取收益信息
+        const yieldInfo = receipt.destToken === 'suiUSDe' 
+            ? {
+                isYieldBearing: true,
+                estimatedAPY: await NttTransferService.getEstimatedYield('suiUSDe'),
+              }
+            : undefined;
+        
+        return {
+            status: receipt.status,
+            yieldMode: receipt.yieldMode,
+            sourceToken: receipt.sourceToken,
+            destToken: receipt.destToken,
+            description: NttTransferService.getYieldModeDescription(receipt.yieldMode, receipt.destToken),
+            yieldInfo,
+        };
+    }
+
+    // ============================================================================
     // API 端點
     
     /**
@@ -517,6 +727,582 @@ export class RelayerService {
             sourceChain: 'Ethereum',
             destChain: 'Sui',
         };
+    }
+
+    // ============================================================================
+    // NTT Event Monitoring & Relay (v2.0)
+    // ============================================================================
+
+    // NTT Manager addresses (loaded from config)
+    private nttManagers: Record<number, string> = {};
+
+    // Sui SDK clients (initialized lazily)
+    private suiClient: any = null;
+    private suiKeypair: any = null;
+
+    // Event unsubscribers
+    private suiEventUnsubscribe: (() => void) | null = null;
+    private evmEventUnsubscribe: (() => void) | null = null;
+
+    /**
+     * 初始化 Sui SDK 客户端
+     */
+    private async initSuiClient(): Promise<void> {
+        if (this.suiClient) return;
+
+        try {
+            const { SuiClient, getFullnodeUrl } = require('@mysten/sui/client');
+            let Ed25519Keypair: any;
+
+            try {
+                Ed25519Keypair = require('@mysten/wallet-standard').Ed25519Keypair;
+            } catch {
+                Ed25519Keypair = require('@mysten/sui/keypairs/ed25519').Ed25519Keypair;
+            }
+
+            this.suiClient = new SuiClient({
+                url: this.config.suiRpcUrl || getFullnodeUrl('mainnet')
+            });
+
+            // 从私钥创建 keypair
+            const privateKeyBase64 = process.env.SUI_PRIVATE_KEY;
+            if (privateKeyBase64) {
+                const privateKeyBytes = Buffer.from(privateKeyBase64, 'base64');
+                this.suiKeypair = new Ed25519Keypair({ secretKey: privateKeyBytes });
+            }
+
+            // 加载 NTT Manager 地址
+            this.nttManagers = {
+                [WORMHOLE_CHAIN_ID.Arbitrum]: process.env.NTT_ARBITRUM_MANAGER || '',
+                [WORMHOLE_CHAIN_ID.Sui]: process.env.NTT_SUI_MANAGER || '',
+            };
+
+            logger.info('Sui SDK client initialized', {
+                nttManagers: Object.keys(this.nttManagers),
+            });
+        } catch (error) {
+            logger.error('Failed to initialize Sui client:', error);
+            throw error;
+        }
+    }
+
+    /**
+     * 監聽 Sui NttOutboundEvent 並 relay 到 EVM
+     *
+     * 流程:
+     * 1. 監聽 Sui 上的 NttOutboundEvent
+     * 2. 解析事件獲取目標鏈、金額、接收者
+     * 3. 調用 NttManager.relay() 完成跨鏈
+     */
+    async listenNttOutboundEvents(): Promise<void> {
+        logger.info('Listening for NTT Outbound events on Sui...');
+
+        try {
+            // 初始化 Sui 客户端
+            await this.initSuiClient();
+
+            if (!this.suiClient) {
+                throw new Error('Sui client not initialized');
+            }
+
+            // 使用 sui client 的事件订阅功能
+            // 监听 NttOutboundEvent 事件
+            const packageId = this.config.suiPackageId;
+
+            // 设置事件过滤器
+            const eventFilter = {
+                MoveEventType: `${packageId}::ntt_integration::NttOutboundEvent`,
+            };
+
+            logger.info('Subscribing to Sui NttOutboundEvent', {
+                eventFilter,
+                packageId,
+            });
+
+            // 使用 poll 方式监听事件 (Sui 的 subscribeEvent API)
+            this.startPollingNttOutboundEvents(packageId);
+
+        } catch (error) {
+            logger.error('Failed to start Sui NTT event listening:', error);
+            throw error;
+        }
+    }
+
+    /**
+     * 轮询 Sui 事件 (由于 Sui SDK 的 subscribeEvent 可能不可用)
+     */
+    private async startPollingNttOutboundEvents(packageId: string): Promise<void> {
+        let lastSeq = 0;
+        const pollInterval = 5000; // 5 秒轮询一次
+
+        logger.info('Starting Sui NTT event polling', {
+            packageId,
+            pollInterval,
+        });
+
+        const poll = async () => {
+            if (!this.isRunning || !this.suiClient) {
+                return;
+            }
+
+            try {
+                // 查询最近的事件
+                const events = await this.suiClient.queryEvents({
+                    query: {
+                        MoveEventType: `${packageId}::ntt_integration::NttOutboundEvent`,
+                    },
+                    order: 'descending',
+                    limit: 10,
+                });
+
+                for (const event of events.data) {
+                    const parsedJson = event.parsedJson as any;
+                    if (!parsedJson) continue;
+
+                    // 跳过已处理的事件 (简单的去重)
+                    const seq = parsedJson.sequence;
+                    if (seq && seq > lastSeq) {
+                        lastSeq = seq;
+
+                        logger.info('Received NttOutboundEvent', {
+                            sequence: seq,
+                            destChain: parsedJson.dest_chain,
+                            amount: parsedJson.amount,
+                        });
+
+                        // Relay 到目标链
+                        await this.relayNttMessage({
+                            sequence: BigInt(seq),
+                            token: parsedJson.token || '',
+                            amount: BigInt(parsedJson.amount || 0),
+                            destChain: parsedJson.dest_chain,
+                            recipient: parsedJson.recipient,
+                            sender: parsedJson.sender,
+                        });
+                    }
+                }
+
+            } catch (error) {
+                logger.error('Error polling Sui NTT events:', error);
+            }
+
+            // 继续轮询
+            if (this.isRunning) {
+                setTimeout(poll, pollInterval);
+            }
+        };
+
+        // 开始轮询
+        poll();
+    }
+
+    /**
+     * 監聽 EVM NttManager 事件並 relay 到 Sui
+     *
+     * 流程:
+     * 1. 監聽 EVM NttManager 的 TransferSent 事件
+     * 2. 獲取 VAA
+     * 3. 調用 Sui NttManager.receive() 完成跨鏈
+     */
+    async listenEvmNttEvents(): Promise<void> {
+        logger.info('Listening for EVM NTT TransferSent events...');
+
+        try {
+            // 获取 NTT Manager 地址
+            const nttManagerAddress = process.env.NTT_ARBITRUM_MANAGER;
+            if (!nttManagerAddress) {
+                throw new Error('NTT_ARBITRUM_MANAGER not configured');
+            }
+
+            // NTT Manager ABI (仅包含事件和 relay 相关函数)
+            const nttManagerAbi = [
+                // TransferSent 事件
+                'event TransferSent(bytes32 indexed digest, uint256 amount, uint16 indexed destinationChain, uint64 sequence, address indexed sender)',
+                // TransferRedeemed 事件
+                'event TransferRedeemed(bytes32 indexed digest, uint16 indexed sourceChain, address indexed recipient, uint256 amount)',
+                // 完成出队转账
+                'function completeOutboundQueuedTransfer(uint64 messageSequence) external payable returns (uint64)',
+            ];
+
+            // 创建合约实例
+            const nttManager = new ethers.Contract(
+                nttManagerAddress,
+                nttManagerAbi,
+                this.evmProvider
+            );
+
+            logger.info('EVM NTT Manager contract connected', {
+                address: nttManagerAddress,
+            });
+
+            // 监听 TransferSent 事件
+            nttManager.on('TransferSent', async (
+                digest: any,
+                amount: any,
+                destinationChain: any,
+                sequence: any,
+                sender: any,
+                event: any
+            ) => {
+                try {
+                    logger.info('Received EVM TransferSent event', {
+                        digest: digest.toString(),
+                        amount: amount.toString(),
+                        destinationChain: destinationChain.toString(),
+                        sequence: sequence.toString(),
+                        sender: sender,
+                        blockNumber: event.blockNumber,
+                    });
+
+                    // 如果目标是 Sui，触发 relay
+                    if (destinationChain === WORMHOLE_CHAIN_ID.Sui) {
+                        await this.relayEvmNttToSui({
+                            digest: digest.toString(),
+                            sequence: sequence.toBigInt(),
+                            amount: amount.toBigInt(),
+                            destChain: destinationChain.toString(),
+                            sender: sender,
+                        });
+                    }
+
+                } catch (error) {
+                    logger.error('Error processing TransferSent event:', error);
+                }
+            });
+
+            // 监听 TransferRedeemed 事件
+            nttManager.on('TransferRedeemed', async (
+                digest: any,
+                sourceChain: any,
+                recipient: any,
+                amount: any,
+                event: any
+            ) => {
+                logger.info('Received EVM TransferRedeemed event', {
+                    digest: digest.toString(),
+                    sourceChain: sourceChain.toString(),
+                    recipient: recipient,
+                    amount: amount.toString(),
+                    blockNumber: event.blockNumber,
+                });
+            });
+
+            // 保存 unsubscribe 函数
+            this.evmEventUnsubscribe = () => {
+                nttManager.removeAllListeners('TransferSent');
+                nttManager.removeAllListeners('TransferRedeemed');
+            };
+
+            logger.info('EVM NTT event listeners registered successfully');
+
+        } catch (error) {
+            logger.error('Failed to start EVM NTT event listening:', error);
+            throw error;
+        }
+    }
+
+    /**
+     * Relay Sui → EVM 的 NTT 消息
+     *
+     * @param event NttOutboundEvent 事件
+     */
+    async relayNttMessage(event: {
+        sequence: bigint;
+        token: string;
+        amount: bigint;
+        destChain: number;
+        recipient: string;
+        sender: string;
+    }): Promise<string> {
+        logger.info('Relaying NTT message to destination chain', {
+            sequence: event.sequence.toString(),
+            destChain: event.destChain,
+            amount: event.amount.toString(),
+            recipient: event.recipient,
+        });
+
+        try {
+            // 获取目标链的 NttManager 地址
+            const destNttManager = this.nttManagers[event.destChain];
+            if (!destNttManager) {
+                throw new Error(`NttManager not configured for chain ${event.destChain}`);
+            }
+
+            // NTT Manager ABI
+            const nttManagerAbi = [
+                'function completeOutboundQueuedTransfer(uint64 messageSequence) external payable returns (uint64)',
+                'function getOutboundQueuedTransfer(uint64 sequence) external view returns (tuple(uint256 amount, uint64 releaseTime, bool completed))',
+            ];
+
+            // 使用钱包签名
+            const wallet = new ethers.Wallet(this.config.evmPrivateKey, this.evmProvider);
+
+            // 创建合约实例
+            const nttManager = new ethers.Contract(
+                destNttManager,
+                nttManagerAbi,
+                wallet
+            );
+
+            // 检查转账是否已完成
+            try {
+                const transferInfo = await nttManager.getOutboundQueuedTransfer(event.sequence);
+                if (transferInfo.completed) {
+                    logger.info('Transfer already completed, skipping relay', {
+                        sequence: event.sequence.toString(),
+                    });
+                    return `already_completed_${event.sequence}`;
+                }
+            } catch {
+                // 如果查询失败，继续尝试 relay
+            }
+
+            // 估算 gas 费用
+            const gasEstimate = await nttManager.completeOutboundQueuedTransfer.estimateGas(event.sequence);
+            const gasPrice = await this.evmProvider.getFeeData();
+            const gasCost = gasEstimate * (gasPrice.gasPrice || BigInt(0));
+
+            logger.info('Calling completeOutboundQueuedTransfer', {
+                sequence: event.sequence.toString(),
+                gasEstimate: gasEstimate.toString(),
+                gasCost: gasCost.toString(),
+            });
+
+            // 调用 completeOutboundQueuedTransfer
+            // 注意: 在 burning mode 下，可能不需要发送 ETH
+            let tx;
+            try {
+                tx = await nttManager.completeOutboundQueuedTransfer(event.sequence, {
+                    gasLimit: gasEstimate * BigInt(12) / BigInt(10), // 20% buffer
+                });
+            } catch (error: any) {
+                // 如果失败，尝试带 value 调用 (某些实现需要)
+                logger.warn('Failed without value, retrying with value', { error: error.message });
+                tx = await nttManager.completeOutboundQueuedTransfer(event.sequence, {
+                    value: event.amount,
+                    gasLimit: gasEstimate * BigInt(12) / BigInt(10),
+                });
+            }
+
+            // 等待交易确认
+            const receipt = await tx.wait();
+
+            logger.info('NTT message relayed successfully', {
+                sequence: event.sequence.toString(),
+                txHash: receipt.hash,
+                blockNumber: receipt.blockNumber,
+                status: receipt.status === 1 ? 'success' : 'failed',
+            });
+
+            return receipt.hash;
+
+        } catch (error) {
+            logger.error('Failed to relay NTT message:', {
+                sequence: event.sequence.toString(),
+                error,
+            });
+            throw error;
+        }
+    }
+
+    /**
+     * Relay EVM → Sui 的 NTT 消息
+     *
+     * @param params 轉账參數
+     */
+    async relayEvmNttToSui(params: {
+        digest: string;
+        sequence: bigint;
+        amount: bigint;
+        destChain: string;
+        sender: string;
+    }): Promise<string> {
+        logger.info('Relaying NTT message from EVM to Sui', {
+            digest: params.digest,
+            sequence: params.sequence.toString(),
+            amount: params.amount.toString(),
+            sender: params.sender,
+        });
+
+        try {
+            // 初始化 Sui 客户端
+            await this.initSuiClient();
+
+            if (!this.suiClient || !this.suiKeypair) {
+                throw new Error('Sui client or keypair not initialized');
+            }
+
+            // 获取 VAA 从 Wormhole API
+            const vaa = await this.getVAAFromApi(params.sequence, WORMHOLE_CHAIN_ID.Arbitrum);
+
+            if (!vaa || vaa.length === 0) {
+                throw new Error('Failed to retrieve VAA from Wormhole');
+            }
+
+            // 获取 Sui NttManager 地址
+            const suiNttManager = this.nttManagers[WORMHOLE_CHAIN_ID.Sui];
+            if (!suiNttManager) {
+                throw new Error('Sui NttManager not configured');
+            }
+
+            // 动态导入 Sui SDK
+            const { Transaction } = require('@mysten/sui/transactions');
+
+            // 构建 Sui PTB 来完成跨链转账
+            const tx = new Transaction();
+
+            // 调用 NttManager.redeem() 来完成转账
+            // 参数: vaa (signed VAA bytes)
+            tx.moveCall({
+                target: `${suiNttManager}::ntt_manager::redeem`,
+                arguments: [
+                    // NttManager object
+                    tx.object(suiNttManager),
+                    // VAA bytes
+                    tx.pure.u8Array(Array.from(vaa)),
+                ],
+            });
+
+            logger.info('Built Sui redeem PTB', {
+                target: `${suiNttManager}::ntt_manager::redeem`,
+                vaaLength: vaa.length,
+            });
+
+            // 发送交易
+            const result = await this.suiClient.signAndExecuteTransaction({
+                transaction: tx,
+                signer: this.suiKeypair,
+                options: {
+                    showEffects: true,
+                    showEvents: true,
+                },
+                requestType: 'WaitForLocalExecution',
+            });
+
+            logger.info('Sui redeem transaction submitted', {
+                txHash: result.digest,
+                status: result.effects?.status?.status,
+            });
+
+            // 检查交易状态
+            if (result.effects?.status?.status !== 'success') {
+                const errorMsg = result.effects?.status?.error || 'Unknown error';
+                throw new Error(`Sui redeem transaction failed: ${errorMsg}`);
+            }
+
+            return result.digest;
+
+        } catch (error) {
+            logger.error('Failed to relay EVM NTT message to Sui:', {
+                sequence: params.sequence.toString(),
+                error,
+            });
+            throw error;
+        }
+    }
+
+    /**
+     * 从 Wormhole API 获取 VAA
+     */
+    private async getVAAFromApi(sequence: bigint, sourceChain: number): Promise<Uint8Array> {
+        const wormholeApiUrl = process.env.WORMHOLE_RPC_URL || 'https://wormhole-v2-mainnet-api.securenode.xyz';
+
+        try {
+            // 构建 API URL
+            // Wormhole VAA API: /v1/signed_vaa/{emitterChain}/{emitterAddress}/{sequence}
+            const emitterAddress = process.env.NTT_ARBITRUM_MANAGER?.toLowerCase().replace('0x', '') || '';
+            const apiUrl = `${wormholeApiUrl}/v1/signed_vaa/${sourceChain}/${emitterAddress}/${sequence}`;
+
+            logger.info('Fetching VAA from Wormhole API', {
+                url: apiUrl,
+                sequence: sequence.toString(),
+            });
+
+            const response = await fetch(apiUrl);
+
+            if (!response.ok) {
+                if (response.status === 404) {
+                    logger.warn('VAA not found yet, may need to wait for guardian observation');
+                    return new Uint8Array();
+                }
+                throw new Error(`Wormhole API error: ${response.status}`);
+            }
+
+            // VAA API 返回 base64 编码的数据
+            const data = await response.json() as { vaaBytes?: string };
+            const vaaBase64 = data.vaaBytes;
+
+            if (!vaaBase64) {
+                throw new Error('No vaaBytes in response');
+            }
+
+            // 解码 base64
+            const vaaBuffer = Buffer.from(vaaBase64, 'base64');
+            return new Uint8Array(vaaBuffer);
+
+        } catch (error) {
+            logger.error('Failed to fetch VAA from Wormhole API:', {
+                sequence: sequence.toString(),
+                error,
+            });
+            return new Uint8Array();
+        }
+    }
+
+    // ============================================================================
+    // NTT Rate Limit Management
+    // ============================================================================
+
+    /**
+     * 查詢目標鏈的速率限制狀態
+     */
+    async getNttRateLimitStatus(chainId: number): Promise<{
+        maxOutflow: bigint;
+        currentOutflow: bigint;
+        windowStart: bigint;
+        windowSecs: bigint;
+    }> {
+        // TODO: 實現實際的查詢邏輯
+        // 
+        // const nttManager = new ethers.Contract(
+        //     this.config.nttManagerAddress,
+        //     NTT_MANAGER_ABI,
+        //     this.evmProvider
+        // );
+        // 
+        // const capacity = await nttManager.getCurrentInboundCapacity(chainId);
+        // return capacity;
+
+        return {
+            maxOutflow: BigInt(100_000_000_000),
+            currentOutflow: BigInt(0),
+            windowStart: BigInt(Math.floor(Date.now() / 1000)),
+            windowSecs: BigInt(3600),
+        };
+    }
+
+    /**
+     * 取消超時的排隊轉賬
+     */
+    async completeQueuedTransfers(): Promise<string[]> {
+        logger.info('Checking for queued transfers to complete...');
+
+        // TODO: 實現實際的完成排隊轉賬邏輯
+        // 
+        // 1. 查詢 NttManager 的排隊轉账
+        // const queuedTransfers = await this.getQueuedTransfers();
+        // 
+        // 2. 遍歷並完成超時的轉账
+        // const completed: string[] = [];
+        // for (const transfer of queuedTransfers) {
+        //     if (this.isTransferTimedOut(transfer)) {
+        //         const txHash = await this.completeQueuedTransfer(transfer.sequence);
+        //         completed.push(txHash);
+        //     }
+        // }
+
+        logger.info('Queued transfers check completed');
+        return [];
     }
 }
 
