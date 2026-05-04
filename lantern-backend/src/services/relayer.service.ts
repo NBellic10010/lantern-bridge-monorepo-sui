@@ -1332,8 +1332,6 @@ export class RelayerService {
         logger.info('Queued transfers check completed');
         return [];
     }
-<<<<<<< HEAD
-=======
 
     // ============================================================================
     // Navi Yield 集成
@@ -1422,7 +1420,6 @@ export class RelayerService {
             // 不抛出错误：跨链已完成，Navi 存款失败不应阻断主流程
         }
     }
->>>>>>> 4d98564 (feat: P0+P1 yield layer fixes - admin governance, fee routing, Navi integration)
 }
 
 export default RelayerService;
