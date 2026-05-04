@@ -13,6 +13,7 @@
   "dependencies": {
     "@mysten/dapp-kit": "^0.1.0",
     "@mysten/sui": "^1.0.0",
+    "@naviprotocol/lending": "^1.0.6",
     "@prisma/client": "^5.7.0",
     "@pythnetwork/pyth-sui-js": "^1.0.0",
     "@wormhole-foundation/sdk": "^1.0.0",

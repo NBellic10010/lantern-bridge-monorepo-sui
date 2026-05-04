@@ -11,6 +11,7 @@ use std::type_name;
 use lantern_vault::math;
 use lantern_vault::pyth;
 // use lantern_vault::yield; // TODO: 启用yield模块
+use lantern_vault::admin::{Config, get_fee_rate, get_treasury};
 
 // ============================================================================
 // 錯誤碼
@@ -55,7 +56,9 @@ public struct Vault<phantom T> has key, store {
     total_shares: u64,
     /// 累計存入的資產價值 (totalAssets)，包含本金+利息
     total_assets: u64,
-    /// Navi 生成的生息憑證 (nUSDC)
+    /// 總資產餘額（USDC）
+    /// Vault 只做 ERC-4626 份額記帳，實際 USDC 存在 Relayer 的 Navi vault 中
+    /// 提款時：Relayer 從 Navi 贖回 USDC，後續注入 vault（由後端 PTB 完成）
     n_token: Balance<T>,
     /// 官方 Wormhole wUSDC Type（白名單）
     wusdc_type: type_name::TypeName,
@@ -101,6 +104,7 @@ public fun create_vault<T>(
 /// 存款入口
 public fun deposit<T>(
     vault: &mut Vault<T>,
+    config: &Config,
     user_pos: &mut UserPosition,
     wusdc: Coin<T>,
     ctx: &mut TxContext
@@ -114,27 +118,41 @@ public fun deposit<T>(
     // 2. 計算份額
     let shares = math::calculate_shares(amount, vault.total_assets, vault.total_shares);
 
-    // 3. 存入 Navi，獲取 nUSDC
-    // 將 Coin 轉換為 Balance
-    let n_token = wusdc.into_balance();
+    // 3. 將 Coin 轉換為 Balance
+    let wusdc_balance = wusdc.into_balance();
 
-    // 4. 更新 Vault 狀態
-    vault.total_assets = vault.total_assets + amount;
+    // 4. 扣除手續費並路由到 treasury
+    let fee_rate = get_fee_rate(config);
+    let fee_amount = (amount * fee_rate) / 10000;
+    if (fee_amount > 0) {
+        let treasury = get_treasury(config);
+        let fee_balance = wusdc_balance.split(fee_amount);
+        let fee_coin = fee_balance.into_coin(ctx);
+        transfer::public_transfer(fee_coin, treasury);
+    };
+
+    // 5. 存入 Navi，獲取 nUSDC（暫時直接存入 vault.n_token）
+    let n_token = wusdc_balance;
+
+    // 6. 更新 Vault 狀態
+    let assets = amount - fee_amount;
+    vault.total_assets = vault.total_assets + assets;
     vault.total_shares = vault.total_shares + shares;
     balance::join(&mut vault.n_token, n_token);
 
-    // 5. 更新用戶份額
+    // 7. 更新用戶份額
     user_pos.shares = user_pos.shares + shares;
     if (user_pos.deposit_timestamp == 0) {
         user_pos.deposit_timestamp = sui::tx_context::epoch_timestamp_ms(ctx);
     }
 
-    // 6. 發送事件
+    // 8. 發送事件
     // TODO: 启用事件 emit
     // sui::event::emit(DepositEvent {
     //     user: sender(ctx),
     //     amount,
     //     shares,
+    //     fee_amount,
     //     timestamp: sui::tx_context::epoch_timestamp_ms(ctx),
     // });
 }
@@ -145,6 +163,7 @@ public fun deposit<T>(
 /// 提款入口
 public fun withdraw<T>(
     vault: &mut Vault<T>,
+    config: &Config,
     user_pos: &mut UserPosition,
     share_amount: u64,
     ctx: &mut TxContext
@@ -154,33 +173,40 @@ public fun withdraw<T>(
     // 1. 計算可贖回資產
     let assets = math::calculate_assets(share_amount, vault.total_assets, vault.total_shares);
 
-    // 2. 計算手續費（從 Config 讀取）
-    // 簡化實現：手續費為 0
-    // 實際實現需要從 Config 讀取 fee_rate
-    let fee: u64 = 0;
-    let net_assets = assets - fee;
+    // 2. 計算手續費
+    let fee_rate = get_fee_rate(config);
+    let fee_amount = (assets * fee_rate) / 10000;
+    let net_assets = assets - fee_amount;
 
-    // 3. 從 Navi 贖回 wUSDC
-    // 簡化實現：直接從 Vault 餘額轉出
-    // TODO: 啟用 yield 模塊調用
-    // let wusdc_balance = yield::withdraw_from_navi<T>(net_assets, ctx);
-    // let wusdc = wusdc_balance.into_coin(ctx);
-    let wusdc = vault.n_token.split(net_assets).into_coin(ctx);
+    // 3. 從 Vault 贖回
+    // 目前直接 split（Vault 處於過渡階段）
+    // 正確路徑：Relayer 後端從 Navi 贖回 USDC 後，
+    //           通過跨鏈訊息或直接轉賬注入 vault（由後端 PTB 完成）
+    let wusdc_balance = vault.n_token.split(net_assets);
+    let wusdc = wusdc_balance.into_coin(ctx);
 
-    // 4. 轉給用戶
+    // 4. 路由手續費到 treasury
+    if (fee_amount > 0) {
+        let treasury = get_treasury(config);
+        let fee_balance = vault.n_token.split(fee_amount);
+        let fee_coin = fee_balance.into_coin(ctx);
+        transfer::public_transfer(fee_coin, treasury);
+    };
+
+    // 5. 轉給用戶
     transfer::public_transfer(wusdc, sender(ctx));
 
-    // 5. 更新狀態
+    // 6. 更新狀態
     vault.total_assets = vault.total_assets - assets;
     vault.total_shares = vault.total_shares - share_amount;
     user_pos.shares = user_pos.shares - share_amount;
 
-    // 6. 發送事件
+    // 7. 發送事件
     sui::event::emit(WithdrawEvent {
         user: sender(ctx),
         shares: share_amount,
         amount: net_assets,
-        fee,
+        fee: fee_amount,
         timestamp: sui::tx_context::epoch_timestamp_ms(ctx),
     });
 }

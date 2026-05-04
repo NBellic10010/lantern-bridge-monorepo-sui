@@ -1190,6 +1190,34 @@ export class RelayerService {
                 throw new Error(`Sui redeem transaction failed: ${errorMsg}`);
             }
 
+            // === Yield 模式处理：跨链完成后的 Navi 存款 ===
+            const messageId = `ntt_evm_${params.sequence}`;
+            const receipt = await this.getTransferReceiptByMessageId(messageId);
+
+            if (receipt && receipt.yieldMode === 'yield') {
+                // 从 objectChanges 中提取刚 mint 出来的 USDC Coin object ID
+                const mintedCoin = result.objectChanges?.find(
+                    (change: any) =>
+                        change.type === 'created' &&
+                        change.objectType?.includes('Coin') &&
+                        change.objectType?.includes('USDC')
+                );
+
+                if (mintedCoin?.objectId) {
+                    await this.depositToNavi({
+                        coinObjectId: mintedCoin.objectId,
+                        amount: params.amount,
+                        recipient: receipt.recipient,
+                        messageId,
+                    });
+                } else {
+                    logger.warn('Yield mode enabled but could not find minted USDC coin in objectChanges', {
+                        objectChanges: result.objectChanges,
+                        messageId,
+                    });
+                }
+            }
+
             return result.digest;
 
         } catch (error) {
@@ -1304,6 +1332,97 @@ export class RelayerService {
         logger.info('Queued transfers check completed');
         return [];
     }
+<<<<<<< HEAD
+=======
+
+    // ============================================================================
+    // Navi Yield 集成
+    // ============================================================================
+
+    /**
+     * 根据 messageId 查询转账记录
+     */
+    private async getTransferReceiptByMessageId(messageId: string): Promise<any> {
+        try {
+            const redis = RedisService.getInstance();
+            const key = `ntt:receipt:${messageId}`;
+            const data = await redis.get(key);
+            return data ? JSON.parse(data) : null;
+        } catch (error) {
+            logger.warn('Failed to get transfer receipt from Redis:', error);
+            return null;
+        }
+    }
+
+    /**
+     * 将 USDC 存入 Navi 获取收益
+     *
+     * 在跨链完成（USDC 已 mint 到用户地址）后执行
+     * 注意：存入 Navi 后凭证 nUSDC 归 Relayer 地址持有
+     */
+    private async depositToNavi(params: {
+        coinObjectId: string;
+        amount: bigint;
+        recipient: string;
+        messageId: string;
+    }): Promise<void> {
+        try {
+            // 动态导入 Navi SDK 和 Sui Transaction
+            const { Transaction } = require('@mysten/sui/transactions');
+            const { depositCoinPTB } = require('@naviprotocol/lending');
+
+            // Navi nUSDC 的 coinType（主网）
+            const USDC_COIN_TYPE =
+                '0xdba34672e30cb065b1f93e3ab55318768fd6fef66c15942c9f7cb846e2f900e7::usdc::USDC';
+
+            // 构建存款 PTB
+            const tx = new Transaction();
+
+            depositCoinPTB(tx, 'nUSDC', { objectId: params.coinObjectId }, {
+                amount: Number(params.amount),
+                market: 'main',
+            });
+
+            logger.info('Built Navi deposit PTB', {
+                coinObjectId: params.coinObjectId,
+                amount: params.amount.toString(),
+                recipient: params.recipient,
+            });
+
+            // 执行存款
+            const result = await this.suiClient.signAndExecuteTransaction({
+                transaction: tx,
+                signer: this.suiKeypair,
+                options: {
+                    showEffects: true,
+                    showEvents: true,
+                },
+                requestType: 'WaitForLocalExecution',
+            });
+
+            if (result.effects?.status?.status === 'success') {
+                logger.info('Navi deposit successful', {
+                    txHash: result.digest,
+                    messageId: params.messageId,
+                    originalRecipient: params.recipient,
+                    note: 'nUSDC retained by relayer address',
+                });
+            } else {
+                logger.error('Navi deposit failed', {
+                    error: result.effects?.status?.error,
+                    messageId: params.messageId,
+                });
+            }
+        } catch (error) {
+            logger.error('Failed to deposit to Navi:', {
+                error,
+                messageId: params.messageId,
+                coinObjectId: params.coinObjectId,
+            });
+            // 不抛出错误：跨链已完成，Navi 存款失败不应阻断主流程
+        }
+    }
+>>>>>>> 4d98564 (feat: P0+P1 yield layer fixes - admin governance, fee routing, Navi integration)
 }
 
 export default RelayerService;

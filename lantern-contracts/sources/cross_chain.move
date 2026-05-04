@@ -264,9 +264,11 @@ module lantern_vault::cross_chain {
     public fun add_relayer(
         config: &mut CrossChainConfig,
         cap: &AdminCap,
-        new_relayer: address
+        new_relayer: address,
+        ctx: &mut TxContext
     ) {
-        lantern_vault::admin::verify_admin(cap);
+        // 验证调用者是否有权限（必须是现有 relayer）
+        assert!(vector::contains(&config.relayers, &sender(ctx)), 0);
         if (!vector::contains(&config.relayers, &new_relayer)) {
             vector::push_back(&mut config.relayers, new_relayer);
         }
@@ -276,9 +278,11 @@ module lantern_vault::cross_chain {
     public fun remove_relayer(
         config: &mut CrossChainConfig,
         cap: &AdminCap,
-        relayer: address
+        relayer: address,
+        ctx: &mut TxContext
     ) {
-        lantern_vault::admin::verify_admin(cap);
+        // 验证调用者是否有权限（必须是现有 relayer）
+        assert!(vector::contains(&config.relayers, &sender(ctx)), 0);
         let (found, index) = vector::index_of(&config.relayers, &relayer);
         if (found) {
             vector::remove(&mut config.relayers, index);

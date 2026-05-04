@@ -3,7 +3,7 @@
 module lantern_vault::admin;
 
 use sui::object::{UID, ID};
-use sui::tx_context::TxContext;
+use sui::tx_context::{TxContext, sender};
 use sui::transfer;
 
 // ============================================================================
@@ -31,6 +31,8 @@ public struct AdminCap has key, store {
 /// 存放協議的全局參數
 public struct Config has key, store {
     id: UID,
+    /// 管理員地址
+    admin: address,
     /// 手續費費率 (basis points, 如 100 = 1%)
     fee_rate: u64,
     /// 手續費歸屬地址
@@ -68,6 +70,7 @@ public struct Config has key, store {
 public fun initialize(ctx: &mut TxContext) {
     let config = Config {
         id: object::new(ctx),
+        admin: ctx.sender(),
         fee_rate: 100,              // 默認 1%
         treasury: ctx.sender(),
         paused: false,
@@ -98,22 +101,24 @@ public fun initialize(ctx: &mut TxContext) {
 // 權限管理
 
 /// 驗證是否為管理員
-public fun verify_admin(_cap: &AdminCap) {
-    // 實際實現可以記錄管理員地址
-    // 這裡簡化處理
+public fun verify_admin(cap: &AdminCap, config: &Config, ctx: &TxContext) {
+    // cap 存在性检查
+    assert!(object::id(cap) != @0x0, ENotAdmin);
+    // 验证交易发起者是否为管理员
+    assert!(sender(ctx) == config.admin, ENotAdmin);
 }
 
 // ============================================================================
 // 配置管理
 
-/// 設定手續費費率
+/// 設定手續費費率（緊急路徑，跳過時間鎖）
 public fun set_fee_rate(
     config: &mut Config,
     cap: &AdminCap,
-    new_rate: u64
+    new_rate: u64,
+    ctx: &mut TxContext
 ) {
-    // 驗證權限
-    verify_admin(cap);
+    verify_admin(cap, config, ctx);
 
     // 費率不能超過 5%
     assert!(new_rate <= 500, EInvalidFeeRate);
@@ -125,9 +130,10 @@ public fun set_fee_rate(
 public fun set_treasury(
     config: &mut Config,
     cap: &AdminCap,
-    new_treasury: address
+    new_treasury: address,
+    ctx: &mut TxContext
 ) {
-    verify_admin(cap);
+    verify_admin(cap, config, ctx);
     config.treasury = new_treasury;
 }
 
@@ -135,9 +141,10 @@ public fun set_treasury(
 public fun set_min_deposit(
     config: &mut Config,
     cap: &AdminCap,
-    new_min: u64
+    new_min: u64,
+    ctx: &mut TxContext
 ) {
-    verify_admin(cap);
+    verify_admin(cap, config, ctx);
     config.min_deposit = new_min;
 }
 
@@ -145,9 +152,10 @@ public fun set_min_deposit(
 public fun set_max_deposit(
     config: &mut Config,
     cap: &AdminCap,
-    new_max: u64
+    new_max: u64,
+    ctx: &mut TxContext
 ) {
-    verify_admin(cap);
+    verify_admin(cap, config, ctx);
     assert!(new_max == 0 || new_max >= config.min_deposit, EInvalidMaxValue);
     config.max_deposit = new_max;
 }
@@ -156,9 +164,10 @@ public fun set_max_deposit(
 public fun set_max_withdraw(
     config: &mut Config,
     cap: &AdminCap,
-    new_max: u64
+    new_max: u64,
+    ctx: &mut TxContext
 ) {
-    verify_admin(cap);
+    verify_admin(cap, config, ctx);
     config.max_withdraw = new_max;
 }
 
@@ -167,9 +176,10 @@ public fun set_rate_limit(
     config: &mut Config,
     cap: &AdminCap,
     window_ms: u64,
-    max_count: u64
+    max_count: u64,
+    ctx: &mut TxContext
 ) {
-    verify_admin(cap);
+    verify_admin(cap, config, ctx);
     assert!(window_ms > 0 && max_count > 0, EInvalidRateLimit);
     config.rate_limit_window = window_ms;
     config.rate_limit_count = max_count;
@@ -179,9 +189,10 @@ public fun set_rate_limit(
 public fun set_large_tx_threshold(
     config: &mut Config,
     cap: &AdminCap,
-    threshold_bps: u64
+    threshold_bps: u64,
+    ctx: &mut TxContext
 ) {
-    verify_admin(cap);
+    verify_admin(cap, config, ctx);
     // 不能超過 100% (10000 bps)
     assert!(threshold_bps <= 10000, EInvalidMaxValue);
     config.large_tx_threshold_bps = threshold_bps;
@@ -191,9 +202,10 @@ public fun set_large_tx_threshold(
 public fun set_timelock_delay(
     config: &mut Config,
     cap: &AdminCap,
-    delay_seconds: u64
+    delay_seconds: u64,
+    ctx: &mut TxContext
 ) {
-    verify_admin(cap);
+    verify_admin(cap, config, ctx);
     // 最小 1 小時，最大 7 天
     assert!(delay_seconds >= 3600 && delay_seconds <= 604800, EInvalidTimelockDelay);
     config.timelock_delay = delay_seconds;
@@ -209,7 +221,7 @@ public fun initiate_fee_rate_change(
     new_rate: u64,
     ctx: &mut TxContext
 ) {
-    verify_admin(cap);
+    verify_admin(cap, config, ctx);
     assert!(new_rate <= 500, EInvalidFeeRate);
 
     config.pending_fee_rate = new_rate;
@@ -241,7 +253,7 @@ public fun initiate_treasury_change(
     new_treasury: address,
     ctx: &mut TxContext
 ) {
-    verify_admin(cap);
+    verify_admin(cap, config, ctx);
 
     config.pending_treasury = new_treasury;
     config.timelock_unlock_time = sui::tx_context::epoch_timestamp_ms(ctx) + (config.timelock_delay * 1000);
@@ -271,7 +283,7 @@ public fun execute_treasury_change(config: &mut Config, ctx: &mut TxContext) {
 /// 緊急暫停
 /// 暫停後禁止存款，但通常允許提款
 public fun pause(config: &mut Config, cap: &AdminCap, ctx: &mut TxContext) {
-    verify_admin(cap);
+    verify_admin(cap, config, ctx);
     assert!(!config.paused, EAlreadyPaused);
 
     config.paused = true;
@@ -283,7 +295,7 @@ public fun pause(config: &mut Config, cap: &AdminCap, ctx: &mut TxContext) {
 
 /// 解除暫停
 public fun unpause(config: &mut Config, cap: &AdminCap, ctx: &mut TxContext) {
-    verify_admin(cap);
+    verify_admin(cap, config, ctx);
     assert!(config.paused, ENotPaused);
 
     config.paused = false;
@@ -296,6 +308,11 @@ public fun unpause(config: &mut Config, cap: &AdminCap, ctx: &mut TxContext) {
 /// 獲取當前費率
 public fun get_fee_rate(config: &Config): u64 {
     config.fee_rate
+}
+
+/// 獲取管理員地址
+public fun get_admin(config: &Config): address {
+    config.admin
 }
 
 /// 獲取 treasury 地址
@@ -396,6 +413,7 @@ public fun create_config_for_testing(
 ): Config {
     Config {
         id: object::new(ctx),
+        admin: ctx.sender(),
         fee_rate: 100,
         treasury,
         paused: false,
